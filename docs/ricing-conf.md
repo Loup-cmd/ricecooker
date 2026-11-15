@@ -13,7 +13,8 @@ Chaque ricing peut décrire comment il démarre dans `~/.hypr-switch/shells/<nom
 Format (clé=valeur, clés répétables) : la référence est le commentaire d'en-tête de
 `~/.hypr-switch/lib/hypr-switch.lua`. Clés : `description`, `packages`, `aur`, `setup`,
 `start`, `stop`, `wallpaper=builtin`, `private`, `machine_monitors=false`,
-`machine_keyboard=false`, `bind:<action>` (valeur `none` = ne pas lier).
+`machine_keyboard=false`, `bind:<action>` (valeur `none` = ne pas lier),
+`hidden=true`, `picker=<commande>`.
 
 ## Règles qui en découlent
 
@@ -24,6 +25,12 @@ Format (clé=valeur, clés répétables) : la référence est le commentaire d'e
   Les starts de démons partagés doivent être idempotents (`pgrep … || …`).
 - `private=` (ou un dossier nommé comme le ricing) : un `config/<x>` que `default` ne possède
   pas suit le ricing. Voir `is_ricing_unit` dans `ricing-switch`.
+- `hidden=true` : le ricing reste basculable par son nom (`ricing switch default`) mais n'est
+  plus proposé dans le sélecteur. Utile pour un propriétaire de configs partagées dont
+  l'interface n'existe plus ou ne doit pas être choisie.
+- `picker=<commande>` : si le ricing actif en déclare un et que la session est graphique,
+  `ricing switch` sans argument lance cette commande au lieu de rofi (par exemple un mode du
+  lanceur du ricing). rofi reste le secours en terminal ou si la commande échoue.
 
 ## La lib `~/.hypr-switch/lib/`
 

@@ -22,7 +22,8 @@ ricing switch default                                        # retour à Omarchy
   n'est pas de l'interface reste au ricing `default` (ta config d'origine), quel que soit le
   ricing actif.
 - **Ton keymap Omarchy partout.** Un overlay généré rejoue tes raccourcis Omarchy dans chaque
-  ricing, traduits vers ses propres outils (lanceur, barre, notifications…).
+  ricing, traduits vers ses propres outils (lanceur, barre, notifications…). Sans Omarchy
+  installé, chaque ricing garde sa propre keymap et l'overlay machine est seul ajouté.
 - **Ta machine partout.** Un overlay remet tes écrans et ta disposition clavier : les dotfiles
   upstream codent souvent `kb_layout = "us"` et l'écran de leur auteur.
 - **Installation automatique robuste.** `ricing install` lance l'installateur du dépôt dans un

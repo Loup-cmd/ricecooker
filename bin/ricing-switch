@@ -1899,6 +1899,13 @@ ensure_keymap_overlay() {
     # The overlay is a Lua file of Hyprland binds: only Hyprland ricings load
     # it. Plasma/other sessions must be left completely alone.
     [[ "$(shell_session_type "$shell_name")" == "hyprland" ]] || return 0
+    # Without Omarchy there are no defaults to generate the keymap from: ricings
+    # carry their own (or a frozen copy, see rca-freeze-keymap). Only the machine
+    # overlay is still added.
+    if [[ ! -f "${OMARCHY_PATH:-/usr/share/omarchy}/default/hypr/bootstrap.lua" ]]; then
+        patch_machine_include "$shell_name" || return 1
+        return 0
+    fi
 
     if [[ ! -x "$KEYMAP_GENERATOR" ]]; then
         echo "  WARNING: $KEYMAP_GENERATOR is missing or not executable; Omarchy keymap not applied." >&2
@@ -2348,8 +2355,21 @@ pick_shell() {
 
     local current="" name type count marker width=0 current_index=0 i=0
     [[ -f "$CURRENT_SHELL_FILE" ]] && current="$(cat "$CURRENT_SHELL_FILE" 2>/dev/null || true)"
+
+    # The active ricing may provide its own picker (ricing.conf `picker=`), drawn
+    # in its own interface. It is used only from a graphical session.
+    local picker=""
+    [[ -n "$current" ]] && picker="$(shell_meta_value "$current" picker)"
+    if [[ -n "$picker" && -n "${WAYLAND_DISPLAY:-}" ]] && bash -c "$picker" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # Ricings marked `hidden=true` in their ricing.conf (e.g. default, whose
+    # interface is gone with Omarchy) stay switchable by name but are not offered.
     local -a names=() rows=()
-    mapfile -t names < <(printf '%s\n' "${!VALID_SHELLS[@]}" | sort)
+    mapfile -t names < <(for name in "${!VALID_SHELLS[@]}"; do
+        [[ "$(shell_meta_value "$name" hidden)" == "true" && "$name" != "$current" ]] || echo "$name"
+    done | sort)
     for name in "${names[@]}"; do
         (( ${#name} > width )) && width=${#name}
     done

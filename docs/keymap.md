@@ -27,6 +27,13 @@ omarchy-keymap-generate <shell>
 Le `dofile` est protégé par `pcall` : un overlay cassé affiche un avertissement mais ne
 laisse pas l'utilisateur sans bureau.
 
+## Sans Omarchy installé
+
+`/usr/share/omarchy` n'existe plus : `omarchy-keymap-generate` n'a plus de source. `ricing-switch`
+se contente alors d'ajouter l'overlay machine et laisse la keymap du ricing telle quelle —
+un ricing migré doit donc embarquer la sienne (copie figée avec `rca-freeze-keymap`, ou binds
+Lua propres). Aucun avertissement n'est émis dans ce cas.
+
 ## Ce qui est lu, ce qui est écrit
 
 | | Chemin |
