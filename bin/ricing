@@ -1,0 +1,1490 @@
+#!/usr/bin/env bash
+#
+# ricing — wrapper convivial autour de ricing-switch.
+#
+#   ricing switch [nom]               bascule vers un ricing (menu si aucun nom)
+#   ricing list                       liste les ricings capturés
+#   ricing current                    affiche le ricing actif
+#   ricing show <nom>                 détail des fichiers possédés
+#   ricing install [nom] <url> [-y]   installe un ricing depuis un dépôt git,
+#                                     entièrement automatiquement, puis le capture
+#   ricing deps <nom>                 installe les paquets + setup déclarés par un ricing
+#   ricing doctor [nom]               vérifie qu'un ricing est utilisable
+#   ricing cancel                     annule une capture en cours
+#   ricing repair                     répare les liens du ricing actif
+#   ricing reload                     recharge la config du ricing actif
+#
+# `ricing install` exécute l'installateur du dépôt (code arbitraire : vérifie
+# la source). Il est lancé dans un environnement contrôlé : pacman/yay/sudo
+# passent par des cales qui installent les paquets de façon robuste (déjà
+# présents, conflits, AUR, paquets introuvables, base périmée), refusent les
+# suppressions de paquets, les redémarrages, les changements de gestionnaire
+# de connexion et les `hyprctl reload/exit`, et les questions reçoivent « y ».
+# Sans installateur, la configuration du dépôt est copiée (y compris les
+# dépôts façon stow / HyDE / chezmoi) et ses dépendances (README,
+# packages.txt…) installées. Après capture, la config est adaptée à la
+# machine : chemins /home/<autre>, hyprland.conf converti en Lua, ricing.conf
+# (démarrage, arrêt, raccourcis Omarchy, fond d'écran, paquets) généré.
+
+set -euo pipefail
+
+STORAGE_ROOT="${HYPR_SWITCH_ROOT:-$HOME/.hypr-switch}"
+SHELLS_DIR="$STORAGE_ROOT/shells"
+SOURCES_DIR="$STORAGE_ROOT/sources"
+CAPTURE_STATE_DIR="$STORAGE_ROOT/.capture_state"
+CURRENT_SHELL_FILE="$STORAGE_ROOT/.current_shell"
+LIB_DIR="$STORAGE_ROOT/lib"
+LOG_DIR="$STORAGE_ROOT/logs"
+RICING_SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+
+SWITCH_BIN=""
+CONFIG_ITEMS=()
+
+die() { printf 'ricing: %s\n' "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+step() { printf '\n\e[1;36m>>\e[0m %s\n' "$*"; }
+warn() { printf '\e[1;33m!!\e[0m %s\n' "$*" >&2; }
+
+resolve_switch() {
+    if command -v ricing-switch >/dev/null 2>&1; then
+        SWITCH_BIN="ricing-switch"
+    elif command -v hypr-switch >/dev/null 2>&1; then
+        SWITCH_BIN="hypr-switch"
+    else
+        die "ricing-switch introuvable dans le PATH"
+    fi
+}
+
+switch_cmd() {
+    resolve_switch
+    "$SWITCH_BIN" "$@"
+}
+
+usage() {
+    cat <<'EOF'
+ricing — gère plusieurs ricings (Hyprland, KDE Plasma, autres sessions)
+
+Usage:
+  ricing switch [nom]                 Bascule vers [nom], ou ouvre le menu
+  ricing switch --logout <nom>        Force la déconnexion pour appliquer
+  ricing list                         Liste les ricings capturés
+  ricing current                      Affiche le ricing actif
+  ricing show <nom>                   Détaille les fichiers d'un ricing
+  ricing install [nom] <url>          Installe + capture un ricing (automatique)
+      -y, --yes                       Sans aucune confirmation
+      --force                         Réinstalle (remplace ricing et clone existants)
+      --manual                        Installer à la main, puis capturer
+      --no-installer                  Ignore l'installateur, copie la config du dépôt
+      --no-deps                       N'installe aucun paquet
+  ricing deps <nom>                   Installe les paquets et le setup d'un ricing
+  ricing doctor [nom]                 Vérifie qu'un ricing est utilisable
+  ricing cancel                       Annule une capture en cours
+  ricing repair                       Répare les liens du ricing actif
+  ricing reload                       Recharge la config du ricing actif
+  ricing bootstrap                    Capture ta config actuelle comme 'default'
+  ricing help                         Cette aide
+
+URL acceptées : https://github.com/u/r, github.com/u/r, u/r (GitHub),
+git@…, …/tree/<branche>[/<sous-dossier>], ou un dossier local.
+Le nom est déduit du dépôt s'il est omis.
+
+Exemples:
+  ricing install https://github.com/Blapples/SekaiPop -y
+  ricing install nebula LilaccFlowerr/Nebula
+  ricing switch sekaipop
+  ricing switch default
+EOF
+}
+
+cmd_list() { switch_cmd --list; }
+
+cmd_current() {
+    if [[ -f "$CURRENT_SHELL_FILE" ]]; then
+        cat "$CURRENT_SHELL_FILE"
+    else
+        echo "unknown"
+    fi
+}
+
+cmd_show() {
+    [[ $# -ge 1 ]] || die "usage: ricing show <nom>"
+    switch_cmd show "$1"
+}
+
+cmd_switch() {
+    local logout=false name=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --logout|-l) logout=true; shift ;;
+            -h|--help) usage; return 0 ;;
+            -*) die "option inconnue : $1" ;;
+            *)
+                [[ -z "$name" ]] || die "trop d'arguments pour 'ricing switch'"
+                name="$1"; shift ;;
+        esac
+    done
+    if [[ "$logout" == true ]]; then
+        [[ -n "$name" ]] || die "usage: ricing switch --logout <nom>"
+        switch_cmd --logout "$name"
+    elif [[ -z "$name" ]]; then
+        switch_cmd
+    else
+        switch_cmd "$name"
+    fi
+}
+
+cmd_use() { cmd_switch "$@"; }
+cmd_cancel() { switch_cmd capture-cancel; }
+cmd_repair() { switch_cmd --repair; }
+cmd_reload() { switch_cmd --reload; }
+cmd_bootstrap() { switch_cmd bootstrap; }
+
+# ---------------------------------------------------------------------------
+# ricing.conf helpers (same format as ricing-switch / lib/hypr-switch.lua)
+# ---------------------------------------------------------------------------
+
+meta_values() {
+    local file="$SHELLS_DIR/$1/ricing.conf" key="$2" line k v
+    [[ -f "$file" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" == *=* ]] || continue
+        k="${line%%=*}"; v="${line#*=}"
+        k="${k#"${k%%[![:space:]]*}"}"; k="${k%"${k##*[![:space:]]}"}"
+        v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+        [[ "$k" == "$key" && -n "$v" ]] && printf '%s\n' "$v"
+    done < "$file"
+}
+
+# ---------------------------------------------------------------------------
+# Privileges: ask for the sudo password once, keep it fresh in the background
+# ---------------------------------------------------------------------------
+
+SUDO_OK=0
+SUDO_KEEPALIVE_PID=""
+
+sudo_prepare() {
+    [[ "$SUDO_OK" -eq 1 ]] && return 0
+    if [[ $EUID -eq 0 ]]; then SUDO_OK=1; return 0; fi
+    command -v sudo >/dev/null 2>&1 || return 1
+    if sudo -n true 2>/dev/null; then
+        SUDO_OK=1
+    elif [[ -t 0 ]]; then
+        say "Le mot de passe sudo est demandé une seule fois (paquets et installateur)."
+        if sudo -v; then SUDO_OK=1; fi
+    fi
+    if [[ "$SUDO_OK" -eq 1 && -z "$SUDO_KEEPALIVE_PID" ]]; then
+        ( while sleep 45; do sudo -n -v 2>/dev/null || exit 0; kill -0 "$$" 2>/dev/null || exit 0; done ) &
+        SUDO_KEEPALIVE_PID=$!
+    fi
+    [[ "$SUDO_OK" -eq 1 ]]
+}
+
+sudo_release() {
+    [[ -n "$SUDO_KEEPALIVE_PID" ]] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    SUDO_KEEPALIVE_PID=""
+}
+
+as_root() {
+    if [[ $EUID -eq 0 ]]; then
+        "$@"
+    else
+        "${RICING_REAL_SUDO:-/usr/bin/sudo}" "$@"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Robust package installation
+#
+# Never fails the caller: every package ends up installed, already satisfied,
+# replaced by an installed equivalent, or reported in the summary.
+# ---------------------------------------------------------------------------
+
+PKG_REPORT="${RICING_PKG_REPORT:-}"
+REAL_PACMAN="${RICING_REAL_PACMAN:-/usr/bin/pacman}"
+
+pkg_note() {
+    printf '  [paquets] %s\n' "$*" >&2
+    [[ -n "$PKG_REPORT" ]] && printf '%s\n' "$*" >> "$PKG_REPORT" || true
+}
+
+pkg_real_helper() {
+    local h
+    for h in "${RICING_REAL_YAY:-}" "${RICING_REAL_PARU:-}" /usr/bin/yay /usr/bin/paru; do
+        [[ -n "$h" && -x "$h" ]] && { printf '%s' "$h"; return 0; }
+    done
+    return 1
+}
+
+pkg_wait_lock() {
+    local waited=0
+    while [[ -e /var/lib/pacman/db.lck ]]; do
+        if ! pgrep -x pacman >/dev/null 2>&1 && ! pgrep -x yay >/dev/null 2>&1 \
+            && ! pgrep -x paru >/dev/null 2>&1 && ! pgrep -x pamac >/dev/null 2>&1; then
+            pkg_note "verrou pacman orphelin supprimé (/var/lib/pacman/db.lck)"
+            as_root rm -f /var/lib/pacman/db.lck || true
+            break
+        fi
+        (( waited == 0 )) && say "  [paquets] pacman est occupé, attente…" >&2
+        sleep 3; waited=$((waited + 3))
+        (( waited > 600 )) && { pkg_note "pacman toujours verrouillé après 10 min"; return 1; }
+    done
+    return 0
+}
+
+pkg_satisfied() { LC_ALL=C "$REAL_PACMAN" -T "$1" >/dev/null 2>&1; }
+pkg_in_repo() { LC_ALL=C "$REAL_PACMAN" -Sp --print-format '%n' -- "$1" >/dev/null 2>&1; }
+
+pkg_in_aur() {
+    local p="$1" n=""
+    if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+        n="$(curl -fsS --max-time 10 "https://aur.archlinux.org/rpc/v5/info?arg%5B%5D=$p" 2>/dev/null | jq -r '.resultcount // 0' 2>/dev/null || true)"
+        [[ "$n" =~ ^[0-9]+$ ]] && { (( n > 0 )); return; }
+    fi
+    local helper
+    helper="$(pkg_real_helper)" || return 1
+    LC_ALL=C "$helper" -Si --aur "$p" >/dev/null 2>&1
+}
+
+# An installed package that conflicts with $1 (and is not $1 itself).
+pkg_conflict_installed() {
+    local p="$1" line c
+    line="$(LC_ALL=C "$REAL_PACMAN" -Si -- "$p" 2>/dev/null | sed -n 's/^Conflicts With *: *//p' | head -n1)"
+    [[ -z "$line" || "$line" == "None" ]] && return 1
+    for c in $line; do
+        c="${c%%[<>=]*}"
+        [[ -z "$c" || "$c" == "$p" ]] && continue
+        if LC_ALL=C "$REAL_PACMAN" -Qq -- "$c" >/dev/null 2>&1 || pkg_satisfied "$c"; then
+            printf '%s' "$c"; return 0
+        fi
+    done
+    return 1
+}
+
+# Repo install with the usual recoveries. Prints nothing on success.
+pkg_pacman_install() {
+    local -a pkgs=("$@")
+    local log rc
+    log="$(mktemp)"
+    pkg_wait_lock || { rm -f "$log"; return 1; }
+    set +e
+    as_root "$REAL_PACMAN" -S --needed --noconfirm -- "${pkgs[@]}" 2>&1 | tee "$log" >&2
+    rc=${PIPESTATUS[0]}
+    set -e
+    if (( rc != 0 )); then
+        if grep -qiE 'failed retrieving file|failed to retrieve some files|404|could not find database|database file for .* does not exist' "$log"; then
+            pkg_note "base de paquets périmée : mise à jour du système (pacman -Syu)"
+            as_root "$REAL_PACMAN" -Syu --noconfirm >&2 || true
+        elif grep -qiE 'signature .* (is )?(unknown trust|invalid)|invalid or corrupted package \(PGP' "$log"; then
+            pkg_note "trousseau de clés à jour (archlinux-keyring)"
+            as_root "$REAL_PACMAN" -Sy --needed --noconfirm archlinux-keyring >&2 || true
+        fi
+        local -a overwrite=()
+        local path
+        while IFS= read -r path; do
+            [[ -n "$path" ]] && overwrite+=(--overwrite "$path")
+        done < <(sed -n 's/^[^:]*: \(\/.*\) exists in filesystem.*/\1/p' "$log")
+        if (( ${#overwrite[@]} > 0 )); then
+            pkg_note "fichiers déjà présents écrasés pour : ${pkgs[*]}"
+        fi
+        set +e
+        as_root "$REAL_PACMAN" -S --needed --noconfirm "${overwrite[@]}" -- "${pkgs[@]}" >&2
+        rc=$?
+        set -e
+    fi
+    rm -f "$log"
+    return $rc
+}
+
+pkg_aur_install() {
+    local p="$1" helper
+    helper="$(pkg_real_helper)" || {
+        pkg_note "aucun assistant AUR (yay/paru) : $p non installé"
+        return 1
+    }
+    pkg_wait_lock || return 1
+    local -a args=(-S --needed --noconfirm)
+    case "$helper" in
+        *yay) args+=(--answerdiff None --answerclean None --answeredit None --removemake --cleanafter --sudoloop) ;;
+        *paru) args+=(--skipreview --removemake --cleanafter --sudoloop) ;;
+    esac
+    "$helper" "${args[@]}" -- "$p" >&2
+}
+
+# pkg_install [--no-aur] pkg... — the single entry point.
+pkg_install() {
+    local allow_aur=1
+    if [[ "${1:-}" == "--no-aur" ]]; then allow_aur=0; shift; fi
+    local -a want=() repo=() aur=()
+    local raw p alt conflict
+
+    for raw in "$@"; do
+        [[ "$raw" == -* || -z "$raw" ]] && continue
+        p="${raw%%[<>=]*}"
+        [[ "$p" == */* ]] && p="${p##*/}"
+        [[ -n "$p" ]] && want+=("$p")
+    done
+    (( ${#want[@]} > 0 )) || return 0
+
+    if [[ "$SUDO_OK" -ne 1 ]] && ! sudo_prepare; then
+        for p in "${want[@]}"; do
+            pkg_satisfied "$p" || pkg_note "sudo indisponible : $p à installer plus tard (ricing deps)"
+        done
+        return 0
+    fi
+
+    for p in "${want[@]}"; do
+        if pkg_satisfied "$p"; then
+            continue
+        fi
+        if pkg_in_repo "$p"; then
+            if conflict="$(pkg_conflict_installed "$p")"; then
+                pkg_note "$p ignoré : conflit avec $conflict déjà installé (conservé)"
+                continue
+            fi
+            repo+=("$p"); continue
+        fi
+        if (( allow_aur )) && pkg_in_aur "$p"; then
+            aur+=("$p"); continue
+        fi
+        local found=""
+        for alt in "${p%-git}" "${p%-bin}" "$p-bin" "$p-git"; do
+            [[ "$alt" == "$p" ]] && continue
+            if pkg_satisfied "$alt"; then found="installed"; break; fi
+            if pkg_in_repo "$alt"; then repo+=("$alt"); found="$alt"; break; fi
+            if (( allow_aur )) && pkg_in_aur "$alt"; then aur+=("$alt"); found="$alt"; break; fi
+        done
+        if [[ -z "$found" ]]; then
+            pkg_note "$p introuvable (dépôts et AUR) : ignoré"
+        elif [[ "$found" != "installed" ]]; then
+            pkg_note "$p introuvable : remplacé par $found"
+        fi
+    done
+
+    if (( ${#repo[@]} > 0 )); then
+        say "  [paquets] dépôts : ${repo[*]}" >&2
+        if ! pkg_pacman_install "${repo[@]}"; then
+            for p in "${repo[@]}"; do
+                pkg_satisfied "$p" && continue
+                pkg_pacman_install "$p" || {
+                    if (( allow_aur )) && pkg_in_aur "$p"; then aur+=("$p"); else pkg_note "échec d'installation : $p"; fi
+                }
+            done
+        fi
+    fi
+
+    for p in "${aur[@]}"; do
+        pkg_satisfied "$p" && continue
+        say "  [paquets] AUR : $p" >&2
+        if ! pkg_aur_install "$p"; then
+            if [[ "$p" != *-bin ]] && pkg_in_aur "$p-bin" && pkg_aur_install "$p-bin"; then
+                pkg_note "$p (AUR) a échoué : $p-bin installé à la place"
+            else
+                pkg_note "échec d'installation AUR : $p"
+            fi
+        fi
+    done
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Shims put in front of PATH while a repository's installer runs
+# ---------------------------------------------------------------------------
+
+shim_note() { printf '\e[1;33m  [ricing]\e[0m %s\n' "$*" >&2; }
+
+# Split a pacman-style command line into operation flags and targets.
+shim_is_sync_install() {
+    local a sync=0 query=0
+    for a in "$@"; do
+        case "$a" in
+            --sync) sync=1 ;;
+            --search|--info|--print|--list|--groups|--clean) query=1 ;;
+            --*) ;;
+            -*)
+                [[ "$a" == -S* ]] && sync=1
+                [[ "$a" =~ ^-S[a-zA-Z]*[silpgc] ]] && query=1
+                ;;
+        esac
+    done
+    (( sync && !query ))
+}
+
+shim_targets() {
+    local a skip=0
+    for a in "$@"; do
+        if (( skip )); then skip=0; continue; fi
+        case "$a" in
+            --overwrite|--ignore|--ignoregroup|--assume-installed|--config|--dbpath|--root|--cachedir|--arch|--gpgdir|--hookdir|--logfile)
+                skip=1 ;;
+            -*) ;;
+            *) printf '%s\n' "$a" ;;
+        esac
+    done
+}
+
+shim_has_op() {
+    local op="$1" a short; shift
+    case "$op" in remove) short=R ;; upgrade) short=U ;; *) return 1 ;; esac
+    for a in "$@"; do
+        [[ "$a" == "--$op" ]] && return 0
+        [[ "$a" =~ ^-$short ]] && return 0
+    done
+    return 1
+}
+
+shim_pkgmgr() {
+    local tool="$1"; shift
+    local real
+    case "$tool" in
+        pacman) real="$REAL_PACMAN" ;;
+        *) real="$(command -v "$tool" 2>/dev/null || true)"
+           case "$tool" in yay) real="${RICING_REAL_YAY:-$real}" ;; paru) real="${RICING_REAL_PARU:-$real}" ;; esac ;;
+    esac
+
+    if shim_has_op remove "$@"; then
+        shim_note "$tool $*: suppression de paquets refusée (protège Omarchy)"
+        return 0
+    fi
+    if shim_is_sync_install "$@"; then
+        local -a targets=()
+        mapfile -t targets < <(shim_targets "$@")
+        if (( ${#targets[@]} == 0 )); then
+            shim_note "$tool $*: mise à jour complète du système ignorée pendant l'installation"
+            return 0
+        fi
+        if [[ "$tool" == pacman ]]; then
+            pkg_install --no-aur "${targets[@]}"
+        else
+            pkg_install "${targets[@]}"
+        fi
+        return 0
+    fi
+    if shim_has_op upgrade "$@"; then
+        if [[ "$tool" == pacman ]]; then
+            as_root "$REAL_PACMAN" "$@" --noconfirm || shim_note "pacman $*: échec ignoré"
+        else
+            "$real" "$@" --noconfirm || shim_note "$tool $*: échec ignoré"
+        fi
+        return 0
+    fi
+    # Queries and everything else.
+    if [[ "$tool" == pacman ]]; then
+        "$REAL_PACMAN" "$@"
+    else
+        [[ -n "$real" && -x "$real" ]] || { shim_note "$tool absent"; return 1; }
+        "$real" "$@"
+    fi
+}
+
+shim_main() {
+    local name="$1"; shift
+    case "$name" in
+        pacman|yay|paru)
+            shim_pkgmgr "$name" "$@" ;;
+        sudo|doas)
+            local -a opts=()
+            while [[ $# -gt 0 && "$1" == -* ]]; do
+                case "$1" in
+                    -u|-g|-C|-D|-h|-p|-r|-t|-T|-U) opts+=("$1" "${2:-}"); shift 2 || shift ;;
+                    --) shift; break ;;
+                    *) opts+=("$1"); shift ;;
+                esac
+            done
+            [[ $# -gt 0 ]] || { "${RICING_REAL_SUDO:-/usr/bin/sudo}" "${opts[@]}"; return; }
+            case "$(basename "$1")" in
+                pacman|yay|paru) local t; t="$(basename "$1")"; shift; shim_pkgmgr "$t" "$@" ;;
+                reboot|poweroff|shutdown|halt|chsh|systemctl|loginctl|hyprctl)
+                    local t; t="$(basename "$1")"; shift; shim_main "$t" "$@" ;;
+                *) "${RICING_REAL_SUDO:-/usr/bin/sudo}" "${opts[@]}" "$@" ;;
+            esac
+            ;;
+        reboot|poweroff|shutdown|halt)
+            shim_note "$name ignoré (pas de redémarrage pendant l'installation)" ;;
+        chsh)
+            shim_note "chsh ignoré : ton shell de connexion n'est pas modifié" ;;
+        systemctl)
+            local a
+            for a in "$@"; do
+                case "$a" in
+                    reboot|poweroff|halt|kexec|soft-reboot|suspend|hibernate|hybrid-sleep)
+                        shim_note "systemctl $*: ignoré"; return 0 ;;
+                    sddm*|gdm*|lightdm*|ly*|greetd*|display-manager*)
+                        if [[ " $* " == *" enable "* || " $* " == *" disable "* || " $* " == *" mask "* ]]; then
+                            shim_note "systemctl $*: gestionnaire de connexion inchangé"; return 0
+                        fi ;;
+                esac
+            done
+            /usr/bin/systemctl "$@" ;;
+        loginctl)
+            case "${1:-}" in
+                terminate-*|kill-*) shim_note "loginctl $*: ignoré" ;;
+                *) /usr/bin/loginctl "$@" ;;
+            esac ;;
+        hyprctl)
+            if [[ " $* " == *" reload "* || " $* " == *"exit"* || " $* " == *" kill "* ]]; then
+                shim_note "hyprctl $*: ignoré pendant l'installation"
+                return 0
+            fi
+            /usr/bin/hyprctl "$@" ;;
+        pkill|killall)
+            local a
+            for a in "$@"; do
+                case "${a,,}" in
+                    hyprland|hyprland*|uwsm*|sddm|gdm|systemd*|quickshell|qs)
+                        shim_note "$name $*: ignoré (protège la session)"; return 0 ;;
+                esac
+            done
+            "/usr/bin/$name" "$@" ;;
+        *)
+            die "cale inconnue : $name" ;;
+    esac
+}
+
+SHIM_DIR=""
+make_shims() {
+    SHIM_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ricing-shims.XXXXXX")"
+    local s
+    for s in pacman yay paru sudo doas reboot poweroff shutdown halt chsh systemctl loginctl hyprctl pkill killall; do
+        if [[ "$s" == yay || "$s" == paru || "$s" == doas ]]; then
+            command -v "$s" >/dev/null 2>&1 || continue
+        fi
+        printf '#!/usr/bin/env bash\nexec %q __shim %s "$@"\n' "$RICING_SELF" "$s" > "$SHIM_DIR/$s"
+        chmod +x "$SHIM_DIR/$s"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Repository helpers
+# ---------------------------------------------------------------------------
+
+load_config_items() {
+    CONFIG_ITEMS=()
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && CONFIG_ITEMS+=("$line")
+    done < <(switch_cmd --config-items 2>/dev/null || true)
+
+    if [[ ${#CONFIG_ITEMS[@]} -eq 0 ]]; then
+        CONFIG_ITEMS=(
+            hypr quickshell omarchy waybar rofi wofi fuzzel anyrun
+            mako dunst swaync ags eww hyprpanel nwg-panel
+            hypridle hyprlock hyprpaper swww swaybg
+            kitty ghostty alacritty foot
+            gtk-2.0 gtk-3.0 gtk-4.0 qt5ct qt6ct Kvantum xsettingsd
+            kdeglobals plasmarc plasmashellrc
+            plasma-org.kde.plasma.desktop-appletsrc plasma-workspace
+            kwinrc kwinrulesrc kglobalshortcutsrc khotkeysrc konsolerc
+            kscreenlockerrc ksmserverrc kaccessrc krunnerrc powerdevilrc
+            systemsettingsrc aurorae color-schemes
+        )
+    fi
+}
+
+is_config_item() {
+    local name="$1" item
+    for item in "${CONFIG_ITEMS[@]}"; do
+        [[ "$name" == "$item" ]] && return 0
+    done
+    return 1
+}
+
+# Normalise what the user typed into "url<TAB>branch<TAB>subdir".
+normalize_url() {
+    local input="$1" url branch="" subdir=""
+    input="${input%/}"
+    if [[ -d "$input" ]]; then
+        printf '%s\t\t\n' "$(readlink -f "$input")"; return
+    fi
+    case "$input" in
+        git@*|ssh://*|git://*|file://*) url="$input" ;;
+        http://*|https://*) url="$input" ;;
+        github.com/*|gitlab.com/*|codeberg.org/*|bitbucket.org/*) url="https://$input" ;;
+        *) if [[ "$input" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+               url="https://github.com/$input"
+           else
+               url="$input"
+           fi ;;
+    esac
+    if [[ "$url" =~ ^(https?://[^/]+/[^/]+/[^/]+)/(tree|src/branch|-/tree)/([^/]+)(/(.*))?$ ]]; then
+        url="${BASH_REMATCH[1]}"; branch="${BASH_REMATCH[3]}"; subdir="${BASH_REMATCH[5]:-}"
+    fi
+    printf '%s\t%s\t%s\n' "$url" "$branch" "$subdir"
+}
+
+name_from_url() {
+    local u="${1%/}"
+    u="${u%.git}"
+    u="${u##*/}"
+    u="${u//[^A-Za-z0-9._-]/-}"
+    printf '%s' "${u:-ricing}"
+}
+
+clone_repo() {
+    local url="$1" branch="$2" dest="$3" attempt
+    local -a bopt=()
+    [[ -n "$branch" ]] && bopt=(--branch "$branch")
+    for attempt in 1 2 3; do
+        if GIT_TERMINAL_PROMPT=0 git clone --depth 1 --recurse-submodules --shallow-submodules "${bopt[@]}" "$url" "$dest"; then
+            break
+        fi
+        rm -rf "$dest"
+        if GIT_TERMINAL_PROMPT=0 git clone --recurse-submodules "${bopt[@]}" "$url" "$dest"; then
+            break
+        fi
+        rm -rf "$dest"
+        (( attempt < 3 )) && { warn "clonage échoué (tentative $attempt/3), nouvel essai…"; sleep $((attempt * 3)); }
+    done
+    [[ -d "$dest" ]] || return 1
+    if [[ -f "$dest/.gitattributes" ]] && grep -q 'filter=lfs' "$dest/.gitattributes" 2>/dev/null; then
+        if command -v git-lfs >/dev/null 2>&1; then
+            ( cd "$dest" && git lfs pull ) || warn "git lfs pull a échoué (assets volumineux manquants)"
+        else
+            warn "le dépôt utilise Git LFS mais git-lfs n'est pas installé"
+            pkg_install git-lfs && command -v git-lfs >/dev/null 2>&1 && ( cd "$dest" && git lfs install --local && git lfs pull ) || true
+        fi
+    fi
+    return 0
+}
+
+find_installer() {
+    local src="$1" c
+    local -a candidates=(
+        install.sh installation.sh get.sh setup.sh bootstrap.sh installer.sh
+        install install.zsh install.bash Install.sh INSTALL.sh Setup.sh
+        scripts/install.sh scripts/installation.sh scripts/get.sh
+        scripts/setup.sh scripts/bootstrap.sh Scripts/install.sh
+        script/install.sh script/installation.sh script/setup.sh
+        installer/install.sh install/install.sh
+    )
+    for c in "${candidates[@]}"; do
+        [[ -f "$src/$c" ]] && { printf '%s\n' "$src/$c"; return 0; }
+    done
+    return 1
+}
+
+is_nix_repo() {
+    local src="$1"
+    [[ -f "$src/flake.nix" || -f "$src/home.nix" || -f "$src/configuration.nix" ]]
+}
+
+# Packages a repository asks for in plain text: packages.txt & co, and
+# `pacman -S` / `yay -S` / `paru -S` command lines in its README.
+repo_declared_packages() {
+    local src="$1" f
+    for f in packages.txt packages pkglist.txt pkglist pkgs.txt dependencies.txt deps.txt \
+             requirements-arch.txt arch-packages.txt Scripts/pkg_core.lst; do
+        [[ -f "$src/$f" ]] || continue
+        sed -e 's/#.*//' -e 's/|.*//' "$src/$f" | tr ' \t,' '\n\n\n' | grep -E '^[a-z0-9][a-z0-9@._+-]*$' || true
+    done
+    for f in "$src"/README* "$src"/readme* "$src"/docs/INSTALL* "$src"/INSTALL*; do
+        [[ -f "$f" ]] || continue
+        # Join backslash continuations, then pick the install commands.
+        sed -e ':a' -e '/\\$/N; s/\\\n/ /; ta' "$f" \
+            | grep -oE '(sudo[[:space:]]+)?(pacman|yay|paru)[[:space:]]+-S[a-zA-Z]*[[:space:]][^`|&;<>]*' \
+            | sed -E 's/^(sudo[[:space:]]+)?(pacman|yay|paru)[[:space:]]+-S[a-zA-Z]*//' \
+            | tr ' \t' '\n\n' | grep -E '^[a-z0-9][a-z0-9@._+-]*$' || true
+    done
+}
+
+copy_one() {
+    local source="$1" dest="$2"
+    if [[ -L "$dest" ]]; then
+        # A shared/managed link: the installer would write into another shell.
+        warn "$dest est un lien géré par hypr-switch — ignoré"
+        return 1
+    fi
+    mkdir -p "$(dirname "$dest")" || return 1
+    # During a capture an existing dest is a throwaway copy of a stored
+    # snapshot: replace it instead of merging two ricings into one.
+    [[ -e "$dest" ]] && rm -rf "$dest"
+    if [[ -d "$source" ]]; then
+        mkdir -p "$dest" || return 1
+        cp -aL "$source/." "$dest/" 2>/dev/null || cp -a "$source/." "$dest/" || return 1
+    else
+        cp -aL "$source" "$dest" 2>/dev/null || cp -a "$source" "$dest" || return 1
+    fi
+}
+
+copy_tree_no_git() {
+    local source="$1" dest="$2"
+    mkdir -p "$dest" || return 1
+    ( cd "$source" && tar --exclude='./.git' -cf - . ) | ( cd "$dest" && tar -xf - ) || return 1
+}
+
+# Every directory in the repo that looks like a ~/.config payload, best first:
+# explicit .config/config dirs (any case, any depth ≤ 4 — HyDE's
+# Configs/.config, stow packages' <pkg>/.config, chezmoi's dot_config), then
+# the repo root itself.
+payload_roots() {
+    local src="$1" d
+    {
+        find "$src" -mindepth 1 -maxdepth 4 -type d \
+            \( -iname '.config' -o -iname 'config' -o -iname 'configs' -o -name 'dot_config' -o -iname 'dotfiles' \) \
+            -not -path '*/.git/*' -not -path '*/node_modules/*' 2>/dev/null
+        printf '%s\n' "$src"
+    } | while IFS= read -r d; do
+        local n=0 e
+        for e in "$d"/* "$d"/.config; do
+            [[ -e "$e" ]] || continue
+            is_config_item "$(basename "$e")" && n=$((n + 1))
+        done
+        [[ -d "$d/.config" ]] && n=$((n + 1))
+        (( n > 0 )) && printf '%s\t%s\n' "$n" "$d"
+    done | sort -t$'\t' -k1,1nr | cut -f2
+}
+
+# Copy a repository's configuration into ~/.config / ~/.local/share. Returns 0
+# when at least one interface config was copied.
+apply_repo_payload() {
+    local src="$1"
+    local copied=0 config_copied=0
+    local root entry name
+    local -a skipped=()
+    declare -A done_items=()
+
+    # KDE Global Theme: metadata.json + contents/ at the repo root.
+    if [[ -f "$src/metadata.json" && -d "$src/contents" ]]; then
+        name="$(basename "$src")"
+        say "  Thème global Plasma détecté → ~/.local/share/plasma/look-and-feel/$name"
+        if copy_tree_no_git "$src" "$HOME/.local/share/plasma/look-and-feel/$name"; then
+            copied=$((copied + 1))
+        fi
+    fi
+
+    while IFS= read -r root; do
+        [[ -d "$root" ]] || continue
+        [[ -d "$root/.config" && "$(basename "$root")" != ".config" ]] && root="$root/.config"
+        for entry in "$root"/*; do
+            [[ -e "$entry" || -L "$entry" ]] || continue
+            name="$(basename "$entry")"
+            [[ "$name" == ".git" ]] && continue
+            name="${name#dot_}"
+            if ! is_config_item "$name"; then
+                [[ "$root" == "$src" ]] || skipped+=("$name")
+                continue
+            fi
+            [[ -n "${done_items[$name]:-}" ]] && continue
+            if copy_one "$entry" "$HOME/.config/$name"; then
+                say "  config: $name  (depuis ${root#"$src"/})"
+                done_items[$name]=1
+                config_copied=$((config_copied + 1))
+                copied=$((copied + 1))
+            fi
+        done
+    done < <(payload_roots "$src")
+
+    # ~/.local/share theme assets (icons, fonts, themes…), wherever they are.
+    local -a local_roots=()
+    mapfile -t local_roots < <(find "$src" -maxdepth 5 -type d -path '*/.local/share' -not -path '*/.git/*' 2>/dev/null)
+    local_roots+=("$src/local/share" "$src/share")
+    for root in "${local_roots[@]}"; do
+        [[ -d "$root" ]] || continue
+        for entry in "$root"/*; do
+            [[ -e "$entry" ]] || continue
+            name="$(basename "$entry")"
+            case "$name" in
+                themes|icons|fonts|plasma|aurorae|color-schemes|kwin)
+                    if copy_one "$entry" "$HOME/.local/share/$name"; then
+                        say "  local: $name"
+                        copied=$((copied + 1))
+                    fi ;;
+            esac
+        done
+    done
+    for name in themes icons fonts; do
+        [[ -d "$src/$name" ]] || continue
+        if copy_one "$src/$name" "$HOME/.local/share/$name"; then
+            say "  local: $name"
+            copied=$((copied + 1))
+        fi
+    done
+
+    if [[ ${#skipped[@]} -gt 0 ]]; then
+        say "  ignorés (non-interface, restent sur 'default') : ${skipped[*]}"
+    fi
+    (( config_copied > 0 ))
+}
+
+# Interface packages implied by the configs a ricing ships.
+component_package() {
+    case "$1" in
+        waybar) echo waybar ;; swaync|swaync-client) echo swaync ;; dunst|dunstctl) echo dunst ;;
+        mako|makoctl) echo mako ;; rofi) echo rofi ;; wofi) echo wofi ;; fuzzel) echo fuzzel ;;
+        anyrun) echo anyrun ;; eww) echo eww ;; ags) echo aylurs-gtk-shell ;; hyprpanel) echo ags-hyprpanel-git ;;
+        nwg-panel) echo nwg-panel ;; hyprlock) echo hyprlock ;; hypridle) echo hypridle ;;
+        hyprpaper) echo hyprpaper ;; swww|swww-daemon|awww|awww-daemon) echo awww ;; swaybg) echo swaybg ;;
+        kitty) echo kitty ;; ghostty) echo ghostty ;; alacritty) echo alacritty ;; foot) echo foot ;;
+        quickshell|qs) echo quickshell ;; Kvantum) echo kvantum ;; qt5ct) echo qt5ct ;; qt6ct) echo qt6ct ;;
+        cava) echo cava ;; cliphist) echo cliphist ;; wl-paste|wl-copy) echo wl-clipboard ;;
+        swayidle) echo swayidle ;; swaylock) echo swaylock ;; wlogout) echo wlogout ;; wob) echo wob ;;
+        nm-applet) echo network-manager-applet ;; blueman-applet) echo blueman ;;
+        matugen) echo matugen ;; wallust) echo wallust ;; pywal|wal) echo python-pywal ;;
+        playerctl) echo playerctl ;; brightnessctl) echo brightnessctl ;; pamixer) echo pamixer ;;
+        grim) echo grim ;; slurp) echo slurp ;; jq) echo jq ;; hyprpicker) echo hyprpicker ;;
+        *) return 1 ;;
+    esac
+}
+
+# True when the capture has touched at least one interface unit.
+capture_has_interface_changes() {
+    local unit original real item
+    if [[ -f "$CAPTURE_STATE_DIR/restore_manifest" ]]; then
+        while IFS=$'\t' read -r unit original; do
+            [[ -n "$unit" ]] || continue
+            case "$unit" in
+                config/*) real="$HOME/.config/${unit#config/}" ;;
+                local/*) real="$HOME/.local/share/${unit#local/}" ;;
+                *) continue ;;
+            esac
+            [[ -e "$real" ]] || return 0
+            diff -rq "$real" "$original" >/dev/null 2>&1 || return 0
+        done < "$CAPTURE_STATE_DIR/restore_manifest"
+    fi
+    for item in "${CONFIG_ITEMS[@]}"; do
+        real="$HOME/.config/$item"
+        [[ -e "$real" && ! -L "$real" ]] || continue
+        grep -q "^config/$item"$'\t' "$CAPTURE_STATE_DIR/restore_manifest" 2>/dev/null && continue
+        grep -qE $'\t'"config/$item(/|\$)" "$CAPTURE_STATE_DIR/before.snapshot" 2>/dev/null && continue
+        return 0
+    done
+    return 1
+}
+
+run_installer() {
+    local src="$1" installer="$2" log="$3" timeout_s="${RICING_INSTALL_TIMEOUT:-3600}"
+    local rc
+    make_shims
+    local real_yay real_paru
+    real_yay="$(command -v yay 2>/dev/null || true)"
+    real_paru="$(command -v paru 2>/dev/null || true)"
+    local -a runner
+    case "$installer" in
+        *.zsh) runner=(zsh "$installer") ;;
+        *.py) runner=(python3 "$installer") ;;
+        *.sh|*.bash) runner=(bash "$installer") ;;
+        *) if head -n1 "$installer" | grep -q '^#!'; then chmod +x "$installer"; runner=("$installer"); else runner=(bash "$installer"); fi ;;
+    esac
+    set +e
+    (
+        cd "$(dirname "$installer")" || exit 1
+        export PATH="$SHIM_DIR:$PATH"
+        export RICING_REAL_SUDO=/usr/bin/sudo RICING_REAL_PACMAN=/usr/bin/pacman
+        export RICING_REAL_YAY="$real_yay" RICING_REAL_PARU="$real_paru"
+        export RICING_PKG_REPORT="$PKG_REPORT"
+        export RICING_SUDO_OK="$SUDO_OK"
+        export DEBIAN_FRONTEND=noninteractive NONINTERACTIVE=1 PIP_NO_INPUT=1
+        export GIT_TERMINAL_PROMPT=0
+        { yes y 2>/dev/null || true; } | timeout --foreground -k 30 "$timeout_s" "${runner[@]}"
+    ) 2>&1 | tee -a "$log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    rm -rf "$SHIM_DIR"
+    return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# Post-capture adaptation (runs on shells/<name>/configs)
+# ---------------------------------------------------------------------------
+
+# /home/<someone-else>/… → $HOME/… in every text file of the snapshot.
+fix_foreign_home_paths() {
+    local base="$1" f n=0
+    command -v perl >/dev/null 2>&1 || return 0
+    while IFS= read -r -d '' f; do
+        if grep -oE '/home/[A-Za-z0-9._-]+/' "$f" | grep -vqF "/home/$USER/"; then
+            perl -pi -e 's#/home/(?!\Q$ENV{USER}\E/)[A-Za-z0-9._-]+/#$ENV{HOME}/#g' "$f" 2>/dev/null && n=$((n + 1))
+        fi
+    done < <(grep -rlIZ --exclude-dir=.git -E '/home/[A-Za-z0-9._-]+/' "$base" 2>/dev/null)
+    (( n > 0 )) && say "  chemins /home/<autre> corrigés dans $n fichier(s)"
+    return 0
+}
+
+# Comment out every line Hyprland rejects until the file verifies clean.
+verify_and_prune_lua() {
+    local file="$1" pass out lines
+    command -v Hyprland >/dev/null 2>&1 || return 0
+    for pass in 1 2 3 4 5; do
+        out="$(cd /tmp && timeout 30 Hyprland --verify-config -c "$file" 2>&1 | sed -n '/parsing result/,$p' || true)"
+        [[ "$out" == *"config ok"* ]] && return 0
+        lines="$(printf '%s\n' "$out" | awk -v f="$file:" 'index($0, f) == 1 { rest = substr($0, length(f) + 1); sub(/:.*/, "", rest); if (rest ~ /^[0-9]+$/) print rest }' | sort -un)"
+        [[ -n "$lines" ]] || return 0
+        local l
+        for l in $lines; do
+            sed -i "${l}s/^/-- [hypr-switch: rejected] /" "$file"
+        done
+    done
+    return 0
+}
+
+write_lua_wrapper() {
+    local hypr_dir="$1" name="$2" with_converted="$3"
+    {
+        echo "-- $name — Hyprland config generated by \`ricing install\`."
+        echo "-- Omarchy's defaults (session services, window rules, keymap) without the"
+        echo "-- Omarchy shell; the ricing's own look, bar and notifications on top."
+        echo "-- Startup programs live in ~/.hypr-switch/shells/$name/ricing.conf (start=)."
+        echo ""
+        echo 'local home = os.getenv("HOME") or ""'
+        echo 'local hs = dofile(home .. "/.hypr-switch/lib/hypr-switch.lua")'
+        echo 'hs.omarchy_base({ shell = false })'
+        if [[ "$with_converted" == 1 ]]; then
+            echo ""
+            echo "-- Upstream hyprland.conf, converted to Lua (original kept as hyprland.conf.upstream)."
+            echo 'do'
+            echo '  local ok, err = pcall(dofile, home .. "/.config/hypr/hyprland.converted.lua")'
+            echo '  if not ok then print("[hypr-switch] converted config failed: " .. tostring(err)) end'
+            echo 'end'
+        fi
+        echo ""
+        echo "hs.autostart(\"$name\")"
+    } > "$hypr_dir/hyprland.lua"
+}
+
+# Keep start commands that make sense for a ricing on top of Omarchy.
+filter_start_command() {
+    local cmd="$1" first bin
+    cmd="${cmd%&}"; cmd="${cmd%"${cmd##*[![:space:]]}"}"
+    [[ -n "$cmd" ]] || return 1
+    case "$cmd" in
+        *dbus-update-activation-environment*|*"import-environment"*|hash\ *|gsettings\ *|*polkit*|*gnome-keyring*|*xdg-desktop-portal*|*resetxdgportal*|"hyprctl setcursor"*|*fcitx*|*ibus*|*udiskie*|*hypridle*|*swayidle*|*"omarchy-"*)
+            return 1 ;;
+    esac
+    first="${cmd%% *}"
+    [[ "$first" == "bash" || "$first" == "sh" ]] && first="$(printf '%s' "$cmd" | awk '{print $3}')"
+    bin="${first/#\~/$HOME}"; bin="${bin//\$HOME/$HOME}"
+    if [[ "$bin" == /* ]]; then
+        [[ -e "$bin" ]] || return 1
+    elif ! command -v "$bin" >/dev/null 2>&1 && ! component_package "$bin" >/dev/null; then
+        return 1
+    fi
+    printf '%s\n' "$cmd"
+}
+
+pick_wallpaper() {
+    local src="$1" hypr_dir="$2" f
+    [[ -f "$hypr_dir/wallpaper" ]] && return 0
+    f="$(find "$hypr_dir" "$src" -maxdepth 4 -type f \
+            \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' \) \
+            \( -ipath '*wall*' -o -ipath '*background*' -o -ipath '*bg*' \) \
+            -not -path '*/.git/*' -not -ipath '*screenshot*' -not -ipath '*preview*' -not -ipath '*/icons/*' \
+            -size +100k 2>/dev/null | head -n1)"
+    [[ -n "$f" ]] || return 1
+    mkdir -p "$hypr_dir/wallpapers"
+    if [[ "$f" != "$hypr_dir/"* ]]; then
+        cp -a "$f" "$hypr_dir/wallpapers/" || return 1
+        f="$hypr_dir/wallpapers/$(basename "$f")"
+    fi
+    printf '%s\n' "${f#"$hypr_dir"/}" > "$hypr_dir/wallpaper"
+    say "  fond d'écran : ${f#"$hypr_dir"/}"
+}
+
+# Make a freshly captured ricing usable on this machine.
+adapt_captured_ricing() {
+    local name="$1" src="$2"
+    local base="$SHELLS_DIR/$name/configs"
+    local cfg="$base/config"
+    local meta="$SHELLS_DIR/$name/ricing.conf"
+    local hypr="$cfg/hypr"
+    local generated_wrapper=0
+    local -a starts=()
+
+    [[ -d "$base" ]] || return 0
+    step "adaptation du ricing à cette machine"
+    fix_foreign_home_paths "$base"
+
+    # Leftover installer backups inside the snapshot.
+    local b
+    for b in "$cfg"/*; do
+        [[ -e "$b" ]] || continue
+        local bn="${b##*/}"
+        case "${bn,,}" in *.bak*|*-bak*|*backup*|*.old) rm -rf "$b"; say "  sauvegarde d'installateur retirée : $bn" ;; esac
+    done
+
+    local is_hypr=0
+    if [[ -d "$hypr" ]]; then
+        is_hypr=1
+    elif [[ ! -e "$cfg/kdeglobals" && ! -e "$cfg/kwinrc" && ! -e "$cfg/plasmashellrc" && ! -d "$cfg/sway" && ! -d "$cfg/niri" ]]; then
+        # A bar/launcher-only ricing (waybar, rofi…) is a Hyprland ricing here.
+        local i
+        for i in waybar rofi wofi fuzzel swaync dunst mako eww ags quickshell kitty alacritty foot ghostty; do
+            [[ -e "$cfg/$i" ]] && { is_hypr=1; break; }
+        done
+        if (( is_hypr )); then
+            mkdir -p "$hypr"
+            write_lua_wrapper "$hypr" "$name" 0
+            generated_wrapper=1
+            say "  pas de config Hyprland : config Lua minimale (Omarchy + ricing) créée"
+        fi
+    fi
+
+    if (( is_hypr )) && [[ -d "$hypr" && ! -f "$hypr/hyprland.lua" && -f "$hypr/hyprland.conf" ]]; then
+        local startlist
+        startlist="$(mktemp)"
+        if lua "$LIB_DIR/conf2lua.lua" "$hypr/hyprland.conf" "$hypr/hyprland.converted.lua" "$startlist" "$cfg"; then
+            verify_and_prune_lua "$hypr/hyprland.converted.lua"
+            mv "$hypr/hyprland.conf" "$hypr/hyprland.conf.upstream"
+            write_lua_wrapper "$hypr" "$name" 1
+            generated_wrapper=1
+            local line kept
+            while IFS= read -r line; do
+                kept="$(filter_start_command "${line/#\~/$HOME}" || true)"
+                [[ -n "$kept" ]] && starts+=("$kept")
+            done < "$startlist"
+            say "  hyprland.conf converti en Lua (hyprland.converted.lua, ${#starts[@]} programme(s) au démarrage)"
+        else
+            warn "conversion de hyprland.conf impossible ; la config hyprlang est gardée"
+        fi
+        rm -f "$startlist"
+    fi
+
+    [[ -f "$meta" ]] && { say "  ricing.conf existant conservé"; return 0; }
+
+    # Components → start/stop/bind/packages.
+    local -a stops=() pkgs=() binds=()
+    local has_start_for c
+    has_start_for() { local w="$1" s; for s in "${starts[@]}"; do [[ "$s" == "$w"* || "$s" == *"/$w"* ]] && return 0; done; return 1; }
+    if (( generated_wrapper )); then
+        [[ -e "$cfg/waybar" ]] && ! has_start_for waybar && starts+=("waybar")
+        [[ -e "$cfg/swaync" ]] && ! has_start_for swaync && starts+=("swaync")
+        [[ -e "$cfg/dunst" && ! -e "$cfg/swaync" ]] && ! has_start_for dunst && starts+=("dunst")
+        [[ -e "$cfg/mako" && ! -e "$cfg/swaync" && ! -e "$cfg/dunst" ]] && ! has_start_for mako && starts+=("mako")
+        if [[ -d "$cfg/quickshell" ]]; then
+            local q
+            for q in "$cfg/quickshell"/*/shell.qml; do
+                [[ -f "$q" ]] || continue
+                q="$(basename "$(dirname "$q")")"
+                has_start_for "qs -c $q" || has_start_for "quickshell -c $q" || starts+=("qs -c $q")
+            done
+            [[ -f "$cfg/quickshell/shell.qml" ]] && ! has_start_for "qs" && ! has_start_for quickshell && starts+=("qs")
+        fi
+    fi
+    local s word
+    for s in "${starts[@]}"; do
+        word="${s%% *}"; word="$(basename "$word")"
+        case "$word" in
+            waybar|swaync|dunst|mako|eww|ags|hyprpanel|nwg-panel|swww-daemon|awww-daemon|hyprpaper|swaybg|wob|nm-applet|blueman-applet)
+                stops+=("$word") ;;
+        esac
+        c="$(component_package "$word" 2>/dev/null || true)"
+        [[ -n "$c" ]] && pkgs+=("$c")
+    done
+    for c in waybar swaync dunst mako rofi wofi fuzzel hyprlock hypridle kitty alacritty foot ghostty quickshell eww; do
+        [[ -e "$cfg/$c" ]] && pkgs+=("$(component_package "$c")")
+    done
+    [[ -f "$hypr/hyprlock.conf" ]] && pkgs+=(hyprlock)
+    [[ -f "$hypr/hypridle.conf" ]] && pkgs+=(hypridle)
+
+    local launcher=""
+    if [[ -e "$cfg/rofi" ]]; then launcher="rofi -show drun"
+    elif [[ -e "$cfg/wofi" ]]; then launcher="wofi --show drun"
+    elif [[ -e "$cfg/fuzzel" ]]; then launcher="fuzzel"
+    elif [[ -e "$cfg/anyrun" ]]; then launcher="anyrun"
+    fi
+    if [[ -n "$launcher" ]]; then
+        binds+=("bind:menu.root=$launcher" "bind:menu.apps=$launcher" "bind:omarchy-shell omarchy.dock apps=$launcher")
+        [[ "$launcher" == rofi* ]] && binds+=("bind:panel.omarchy.emojis=rofi -show emoji || rofi -show drun")
+        [[ "$launcher" == rofi* ]] && command -v cliphist >/dev/null 2>&1 && binds+=("bind:panel.omarchy.clipboard=cliphist list | rofi -dmenu | cliphist decode | wl-copy")
+    fi
+    if [[ -e "$cfg/waybar" ]]; then
+        binds+=("bind:omarchy-toggle-bar=pkill -SIGUSR1 waybar")
+    fi
+    if [[ -e "$cfg/swaync" ]]; then
+        binds+=("bind:ipc.notifications.act=swaync-client -t -sw" "bind:ipc.notifications.showHistory=swaync-client -t -sw"
+                "bind:ipc.notifications.dismissAll=swaync-client -C -sw" "bind:ipc.notifications.dismissOne=swaync-client --close-latest -sw"
+                "bind:omarchy-toggle-notification-silencing=swaync-client -d -sw")
+    elif [[ -e "$cfg/dunst" ]]; then
+        binds+=("bind:ipc.notifications.act=dunstctl action" "bind:ipc.notifications.showHistory=dunstctl history-pop"
+                "bind:ipc.notifications.dismissAll=dunstctl close-all" "bind:ipc.notifications.dismissOne=dunstctl close"
+                "bind:omarchy-toggle-notification-silencing=dunstctl set-paused toggle")
+    elif [[ -e "$cfg/mako" ]]; then
+        binds+=("bind:ipc.notifications.act=makoctl invoke" "bind:ipc.notifications.showHistory=makoctl restore"
+                "bind:ipc.notifications.dismissAll=makoctl dismiss --all" "bind:ipc.notifications.dismissOne=makoctl dismiss"
+                "bind:omarchy-toggle-notification-silencing=makoctl mode -t do-not-disturb")
+    fi
+    if [[ -e "$cfg/hyprlock" || -f "$hypr/hyprlock.conf" ]]; then
+        binds+=("bind:omarchy-system-lock=hyprlock")
+    fi
+    if [[ -e "$cfg/wlogout" ]] || command -v wlogout >/dev/null 2>&1; then
+        binds+=("bind:menu.system=wlogout")
+    fi
+
+    local wallpaper_mode=""
+    if (( is_hypr )); then
+        pick_wallpaper "$src" "$hypr" || true
+        local draws_bg=0
+        for s in "${starts[@]}"; do
+            case "$s" in *swww*|*awww*|*hyprpaper*|*swaybg*|*mpvpaper*|*wpaperd*|qs*|quickshell*) draws_bg=1 ;; esac
+        done
+        (( generated_wrapper && !draws_bg )) && [[ -f "$hypr/wallpaper" ]] && wallpaper_mode="builtin"
+    fi
+
+    local desc=""
+    for b in "$src"/README* "$src"/readme*; do
+        [[ -f "$b" ]] || continue
+        desc="$(grep -m1 -E '^#{1,2} +[^ ]' "$b" | sed -E 's/^#+ +//; s/<[^>]*>//g' | tr -d '\r' || true)"
+        break
+    done
+
+    {
+        echo "# $name — généré par \`ricing install\` le $(date +%F). Format : voir ~/.hypr-switch/lib/hypr-switch.lua"
+        echo "description=${desc:-$name}"
+        local uniq_pkgs
+        uniq_pkgs="$(printf '%s\n' "${pkgs[@]}" | awk 'NF && !seen[$0]++' | tr '\n' ' ')"
+        [[ -n "${uniq_pkgs// /}" ]] && echo "packages=${uniq_pkgs% }"
+        [[ -n "$wallpaper_mode" ]] && echo "wallpaper=$wallpaper_mode"
+        printf '%s\n' "${starts[@]}" | awk 'NF && !seen[$0]++ {print "start=" $0}'
+        printf '%s\n' "${stops[@]}" | awk 'NF && !seen[$0]++ {print "stop=" $0}'
+        printf '%s\n' "${binds[@]}" | awk 'NF && !seen[$0]++'
+    } > "$meta"
+    say "  ricing.conf généré ($meta)"
+}
+
+# ---------------------------------------------------------------------------
+# deps / doctor
+# ---------------------------------------------------------------------------
+
+cmd_deps() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: ricing deps <nom>"
+    [[ -d "$SHELLS_DIR/$name" ]] || die "ricing inconnu : $name"
+    local -a pkgs=() line
+    local l p
+    while IFS= read -r l; do for p in $l; do pkgs+=("$p"); done; done < <(meta_values "$name" packages)
+    local -a aur=()
+    while IFS= read -r l; do for p in $l; do aur+=("$p"); done; done < <(meta_values "$name" aur)
+    PKG_REPORT="$(mktemp)"
+    if (( ${#pkgs[@]} + ${#aur[@]} > 0 )); then
+        step "paquets pour '$name' : ${pkgs[*]} ${aur[*]}"
+        sudo_prepare || warn "sudo indisponible : les paquets ne peuvent pas être installés"
+        pkg_install "${pkgs[@]}" "${aur[@]}"
+    fi
+    local cmd
+    while IFS= read -r cmd; do
+        step "setup : $cmd"
+        ( cd "$SHELLS_DIR/$name" && bash -c "$cmd" ) || warn "setup '$cmd' a échoué"
+    done < <(meta_values "$name" setup)
+    sudo_release
+    if [[ -s "$PKG_REPORT" ]]; then
+        step "à noter :"; sed 's/^/  - /' "$PKG_REPORT"
+    fi
+    rm -f "$PKG_REPORT"
+    say ""
+    say "Terminé. $( [[ "$(cmd_current)" == "$name" ]] && echo "Recharge avec : ricing switch $name" || echo "Active-le avec : ricing switch $name")"
+}
+
+cmd_doctor() {
+    local name="${1:-$(cmd_current)}" base problems=0
+    base="$SHELLS_DIR/$name/configs/config"
+    [[ -d "$SHELLS_DIR/$name" ]] || die "ricing inconnu : $name"
+    say "Diagnostic de '$name'"
+    if [[ -f "$base/hypr/hyprland.lua" ]]; then
+        if grep -q 'default/hypr/bootstrap.lua\|omarchy_base' "$base/hypr/hyprland.lua"; then
+            luac -p "$base/hypr/hyprland.lua" 2>/dev/null && say "  ok   hyprland.lua (syntaxe Lua)" || { say "  KO   hyprland.lua : erreur de syntaxe"; problems=$((problems+1)); }
+        else
+            # Verify in a throwaway HOME whose ~/.config points at the
+            # ricing: a config may create files under ~/.config when run.
+            local out vhome item
+            vhome="$(mktemp -d)"
+            mkdir -p "$vhome/.config" "$vhome/.local/state"
+            cp -a --reflink=auto "$base"/. "$vhome/.config/" 2>/dev/null || true
+            [[ -d "$STORAGE_ROOT/lib" ]] && mkdir -p "$vhome/.hypr-switch" && ln -s "$STORAGE_ROOT/lib" "$vhome/.hypr-switch/lib"
+            out="$(cd "$vhome" && env -u HYPRLAND_INSTANCE_SIGNATURE HOME="$vhome" timeout 30 Hyprland --verify-config -c "$vhome/.config/hypr/hyprland.lua" 2>&1 | sed -n '/parsing result/,$p' | tail -n +2)"
+            rm -rf "$vhome"
+            if [[ "$out" == *"config ok"* ]]; then say "  ok   hyprland.lua (vérifié par Hyprland)"; else say "  KO   hyprland.lua :"; printf '%s\n' "$out" | sed 's/^/         /' | head -15; problems=$((problems+1)); fi
+        fi
+    elif [[ -d "$base/hypr" ]]; then
+        say "  KO   pas de hyprland.lua (Hyprland 0.56 + overlays hypr-switch l'exigent)"; problems=$((problems+1))
+    fi
+    local missing="" l p
+    while IFS= read -r l; do for p in $l; do pacman -T "$p" >/dev/null 2>&1 || missing+="$p "; done; done < <(meta_values "$name" packages; meta_values "$name" aur)
+    if [[ -n "$missing" ]]; then say "  KO   paquets manquants : $missing → ricing deps $name"; problems=$((problems+1)); else say "  ok   paquets"; fi
+    local cmd bin
+    while IFS= read -r cmd; do
+        bin="${cmd%% *}"; bin="${bin/#\~/$HOME}"
+        # ~/.config/<x> is the ricing's own copy once it is active.
+        if [[ "$bin" == "$HOME/.config/"* && -e "$base/${bin#"$HOME/.config/"}" ]]; then
+            bin="$base/${bin#"$HOME/.config/"}"
+        fi
+        if [[ "$bin" == /* ]]; then [[ -x "$bin" ]] || { say "  KO   start= introuvable : $bin"; problems=$((problems+1)); }
+        elif ! command -v "$bin" >/dev/null 2>&1; then say "  KO   start= commande absente : $bin"; problems=$((problems+1)); fi
+    done < <(meta_values "$name" start)
+    if [[ -f "$base/hypr/wallpaper" ]]; then
+        local wp; wp="$(head -n1 "$base/hypr/wallpaper")"; [[ "$wp" == /* ]] || wp="$base/hypr/$wp"
+        [[ -f "$wp" ]] && say "  ok   fond d'écran" || { say "  KO   fond d'écran introuvable : $wp"; problems=$((problems+1)); }
+    fi
+    local q
+    for q in "$base"/quickshell/*/shell.qml; do
+        [[ -f "$q" ]] && say "  info config Quickshell : $(basename "$(dirname "$q")")"
+    done
+    (( problems == 0 )) && say "Aucun problème détecté." || say "$problems problème(s)."
+    return $(( problems > 0 ))
+}
+
+# ---------------------------------------------------------------------------
+# install
+# ---------------------------------------------------------------------------
+
+cmd_install() {
+    resolve_switch
+
+    local yes=false manual=false force=false no_installer=false no_deps=false
+    local -a positional=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -y|--yes) yes=true; shift ;;
+            --manual) manual=true; shift ;;
+            --force|-f) force=true; shift ;;
+            --no-installer) no_installer=true; shift ;;
+            --no-deps) no_deps=true; shift ;;
+            -h|--help) usage; return 0 ;;
+            -*) die "option inconnue : $1" ;;
+            *) positional+=("$1"); shift ;;
+        esac
+    done
+
+    local name="" url_in=""
+    case ${#positional[@]} in
+        1) url_in="${positional[0]}" ;;
+        2) name="${positional[0]}"; url_in="${positional[1]}" ;;
+        *) die "usage: ricing install [nom] <url-git> [-y] [--force] [--manual]" ;;
+    esac
+
+    local url branch subdir
+    IFS=$'\t' read -r url branch subdir < <(normalize_url "$url_in")
+    [[ -n "$name" ]] || name="$(name_from_url "$url")"
+    [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "nom invalide (lettres, chiffres, . _ - uniquement)"
+    [[ "$name" != "default" ]] || die "'default' est réservé à ta config Omarchy actuelle"
+
+    mkdir -p "$LOG_DIR" "$SOURCES_DIR"
+    local log="$LOG_DIR/install-$name-$(date +%Y%m%d-%H%M%S).log"
+    PKG_REPORT="$(mktemp)"
+    say "Installation de '$name' depuis $url${branch:+ (branche $branch)}${subdir:+ [$subdir]}"
+    say "Journal : $log"
+
+    # --- préconditions -----------------------------------------------------
+    if [[ -d "$CAPTURE_STATE_DIR" ]]; then
+        local other
+        other="$(cat "$CAPTURE_STATE_DIR/shell_name" 2>/dev/null || echo "?")"
+        if [[ "$other" == "$name" || "$yes" == true ]]; then
+            warn "capture précédente de '$other' encore ouverte : annulation"
+            switch_cmd capture-cancel || die "impossible d'annuler la capture de '$other'"
+        else
+            die "une capture est en cours pour '$other' ; fais 'ricing cancel' (ou relance avec -y)"
+        fi
+    fi
+    if [[ -z "$(ls -A "$SHELLS_DIR/default/configs" 2>/dev/null)" ]]; then
+        step "premier usage : capture de ta config actuelle comme 'default'"
+        switch_cmd bootstrap
+    fi
+    if [[ -d "$SHELLS_DIR/$name" ]]; then
+        [[ "$force" == true ]] || die "le ricing '$name' existe déjà (--force pour le réinstaller)"
+        [[ "$(cmd_current)" == "$name" ]] && die "'$name' est le ricing actif : fais 'ricing switch default' avant de le réinstaller"
+        local keep="$STORAGE_ROOT/.cancelled/$name-replaced-$(date +%Y%m%d-%H%M%S)"
+        mkdir -p "$(dirname "$keep")"
+        mv "$SHELLS_DIR/$name" "$keep"
+        say "Ancienne version mise de côté : $keep"
+    fi
+    local avail_mb
+    avail_mb="$(df -Pm "$STORAGE_ROOT" | awk 'NR==2{print $4}')"
+    [[ "${avail_mb:-0}" -ge 1024 ]] || die "espace disque insuffisant (${avail_mb:-?} Mo libres, 1 Go requis)"
+    command -v lua >/dev/null 2>&1 || warn "lua absent : la conversion hyprland.conf → Lua sera sautée"
+
+    load_config_items
+
+    # --- source --------------------------------------------------------------
+    local src="$SOURCES_DIR/$name"
+    if [[ -e "$src" && "$force" == true ]]; then
+        local old="$STORAGE_ROOT/.cancelled/$name-source-$(date +%Y%m%d-%H%M%S)"
+        mkdir -p "$(dirname "$old")"; mv "$src" "$old"
+    fi
+    if [[ -e "$src" ]]; then
+        step "réutilisation du clone existant ($src)"
+        if [[ -d "$src/.git" ]]; then
+            ( cd "$src" && GIT_TERMINAL_PROMPT=0 git pull --ff-only --recurse-submodules >/dev/null 2>&1 ) \
+                && say "  clone mis à jour" || say "  clone gardé tel quel (pas de mise à jour possible)"
+            git -C "$src" checkout -- . >/dev/null 2>&1 || true
+        fi
+    elif [[ -d "$url" ]]; then
+        step "copie de $url"
+        cp -a "$url" "$src" || die "la copie a échoué"
+    else
+        command -v git >/dev/null 2>&1 || die "git est requis"
+        step "clonage de $url"
+        clone_repo "$url" "$branch" "$src" 2>&1 | tee -a "$log" || true
+        [[ -d "$src" ]] || die "git clone a échoué (URL, réseau ou dépôt privé ?)"
+    fi
+    local work="$src"
+    if [[ -n "$subdir" ]]; then
+        work="$src/$subdir"
+        [[ -d "$work" ]] || die "sous-dossier introuvable dans le dépôt : $subdir"
+    fi
+
+    # --- stratégie -----------------------------------------------------------
+    local installer=""
+    [[ "$manual" == true || "$no_installer" == true ]] || installer="$(find_installer "$work" || true)"
+    local nix=0
+    is_nix_repo "$work" && nix=1
+
+    if [[ -n "$installer" ]]; then
+        say ""
+        say "Installateur détecté : ${installer#"$work"/}"
+        say "ATTENTION : il exécute du code arbitraire du dépôt (sans bac à sable)."
+        say "            pacman/yay/sudo, redémarrages et rechargements sont encadrés par ricing."
+        if [[ "$yes" != true ]]; then
+            [[ -t 0 ]] || die "pas de terminal interactif ; relance avec -y pour exécuter sans confirmation"
+            local ans=""
+            read -r -p "Exécuter l'installateur maintenant ? [Y/n] " ans
+            [[ -z "$ans" || "$ans" =~ ^[YyOo]$ ]] || die "installation annulée"
+        fi
+    fi
+    if [[ "$no_deps" != true ]]; then
+        sudo_prepare || warn "sudo indisponible : les paquets seront listés dans ricing.conf (ricing deps $name)"
+    fi
+
+    # --- capture ---------------------------------------------------------------
+    step "démarrage de la capture pour '$name'"
+    switch_cmd capture-start "$name" >> "$log" 2>&1 || die "capture-start a échoué (voir $log)"
+
+    local ok=false
+    cleanup() {
+        local rc=$?
+        sudo_release
+        [[ -n "$SHIM_DIR" ]] && rm -rf "$SHIM_DIR"
+        if [[ "$ok" != true ]]; then
+            echo "!! échec — annulation de la capture (journal : $log)." >&2
+            echo "   Les fichiers modifiés sont conservés dans $STORAGE_ROOT/.cancelled/" >&2
+            switch_cmd capture-cancel >> "$log" 2>&1 || true
+        fi
+        rm -f "$PKG_REPORT"
+        return $rc
+    }
+    trap cleanup EXIT
+    trap 'exit 130' INT TERM
+
+    local installed=false
+    if [[ -n "$installer" ]]; then
+        step "exécution de l'installateur (réponses automatiques, délai max ${RICING_INSTALL_TIMEOUT:-3600}s)"
+        local rc=0
+        run_installer "$work" "$installer" "$log" || rc=$?
+        if capture_has_interface_changes; then
+            installed=true
+            (( rc == 0 )) || warn "l'installateur a terminé avec le code $rc, mais la config a été installée : on continue"
+        else
+            warn "l'installateur (code $rc) n'a installé aucune config d'interface : copie directe de la config du dépôt"
+        fi
+    fi
+
+    if [[ "$installed" != true && "$manual" == true ]]; then
+        say ""
+        say ">> mode manuel : installe le ricing toi-même, puis reviens ici."
+        if [[ -t 0 ]]; then
+            local ans=""
+            read -r -p "Entrée = capturer, q = annuler : " ans
+            [[ "$ans" == "q" || "$ans" == "Q" ]] && die "installation annulée"
+            installed=true
+        else
+            ok=true; trap - EXIT
+            say "Capture laissée ouverte. Ensuite : ricing switch capture-finish $name  (ou ricing cancel)"
+            exit 2
+        fi
+    fi
+
+    if [[ "$installed" != true ]]; then
+        step "copie de la configuration du dépôt"
+        if apply_repo_payload "$work"; then
+            installed=true
+        elif (( nix )); then
+            die "dépôt NixOS/Home Manager sans config brute à copier : il doit être porté à la main (voir ~/.hypr-switch/shells/Nihil pour un exemple)"
+        else
+            die "aucune configuration d'interface trouvée dans le dépôt (essaie --manual)"
+        fi
+        if [[ "$no_deps" != true ]]; then
+            local -a declared=()
+            mapfile -t declared < <(repo_declared_packages "$work" | awk 'NF && !seen[$0]++')
+            if (( ${#declared[@]} > 0 )); then
+                step "dépendances déclarées par le dépôt (${#declared[@]})"
+                pkg_install "${declared[@]}" 2>&1 | tee -a "$log"
+            fi
+        fi
+    fi
+
+    # Interface programs the installed configs need.
+    if [[ "$no_deps" != true ]]; then
+        local -a needed=()
+        local item pkg
+        for item in "${CONFIG_ITEMS[@]}"; do
+            [[ -e "$HOME/.config/$item" && ! -L "$HOME/.config/$item" ]] || continue
+            local orig
+            orig="$(awk -F'\t' -v u="config/$item" '$1 == u {print $2}' "$CAPTURE_STATE_DIR/restore_manifest" 2>/dev/null)"
+            if [[ -n "$orig" ]] && diff -rq "$HOME/.config/$item" "$orig" >/dev/null 2>&1; then
+                continue
+            fi
+            pkg="$(component_package "$item" 2>/dev/null || true)"
+            [[ -n "$pkg" ]] && ! pacman -T "$pkg" >/dev/null 2>&1 && needed+=("$pkg")
+        done
+        if (( ${#needed[@]} > 0 )); then
+            step "programmes requis par la config : ${needed[*]}"
+            pkg_install "${needed[@]}" 2>&1 | tee -a "$log"
+        fi
+    fi
+
+    step "capture du résultat"
+    switch_cmd capture-finish "$name" 2>&1 | tee -a "$log"
+    [[ -d "$SHELLS_DIR/$name/configs" ]] || die "rien n'a été capturé pour '$name'"
+    ok=true
+
+    adapt_captured_ricing "$name" "$work" 2>&1 | tee -a "$log"
+
+    # capture-finish leaves the new ricing's links live; point everything back
+    # at the active ricing so nothing is half-applied until `ricing switch`.
+    HYPR_SWITCH_LINKS_ONLY=1 switch_cmd --repair >> "$log" 2>&1 \
+        || warn "réconciliation des liens échouée (voir $log) ; lance 'ricing repair'"
+
+    # Packages the generated ricing.conf still lists as missing.
+    if [[ "$no_deps" != true && "$SUDO_OK" -eq 1 ]]; then
+        local -a still=() l p
+        while IFS= read -r l; do for p in $l; do pacman -T "$p" >/dev/null 2>&1 || still+=("$p"); done; done < <(meta_values "$name" packages)
+        if (( ${#still[@]} > 0 )); then
+            step "paquets du ricing : ${still[*]}"
+            pkg_install "${still[@]}" 2>&1 | tee -a "$log"
+        fi
+    fi
+
+    trap - EXIT
+    sudo_release
+    [[ -n "$SHIM_DIR" ]] && rm -rf "$SHIM_DIR"
+
+    say ""
+    cmd_doctor "$name" || true
+    if [[ -s "$PKG_REPORT" ]]; then
+        say ""
+        say "À noter (paquets) :"
+        awk '!seen[$0]++' "$PKG_REPORT" | sed 's/^/  - /'
+    fi
+    rm -f "$PKG_REPORT"
+    say ""
+    say "Ricing '$name' installé."
+    say "  Activer :            ricing switch $name"
+    say "  Revenir à Omarchy :  ricing switch default"
+    say "  Réglages du ricing : $SHELLS_DIR/$name/ricing.conf"
+}
+
+case "${1:-}" in
+    ""|help|-h|--help) usage ;;
+    list|ls) cmd_list ;;
+    current|cur) cmd_current ;;
+    switch) shift; cmd_switch "$@" ;;
+    use|set) shift; cmd_use "$@" ;;
+    show) shift; cmd_show "$@" ;;
+    install|add) shift; cmd_install "$@" ;;
+    deps) shift; cmd_deps "$@" ;;
+    doctor|check) shift; cmd_doctor "$@" ;;
+    cancel) cmd_cancel ;;
+    repair) cmd_repair ;;
+    reload) cmd_reload ;;
+    bootstrap) cmd_bootstrap ;;
+    __shim) shift; SUDO_OK="${RICING_SUDO_OK:-0}"; shim_main "$@" ;;
+    __pkg) shift; [[ "${1:-}" == install ]] && shift; SUDO_OK="${RICING_SUDO_OK:-0}"; pkg_install "$@" ;;
+    *) die "commande inconnue : ${1}. Voir 'ricing help'." ;;
+esac

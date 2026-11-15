@@ -1,0 +1,909 @@
+#!/usr/bin/env lua
+-- omarchy-keymap-generate <shell>
+--
+-- Rebuild ~/.hypr-switch/keymap/omarchy-keymap.lua: the Omarchy keymap, with
+-- shell-specific actions translated for the target ricing, loaded by that
+-- ricing's Hyprland config after its own keybinds.
+--
+-- The keymap is read from the stored "default" shell (Omarchy), never from
+-- ~/.config, which points at whichever ricing is active. Nothing under
+-- /usr/share/omarchy is modified.
+
+local home = os.getenv("HOME") or ""
+local shell = arg[1] or ""
+
+if shell == "" then
+  io.stderr:write("usage: omarchy-keymap-generate <shell>\n")
+  os.exit(2)
+end
+
+-- "default" already owns Omarchy's bindings; no overlay is needed there.
+if shell == "default" then
+  os.exit(0)
+end
+
+local storage = home .. "/.hypr-switch"
+local shell_root = storage .. "/shells/" .. shell .. "/configs"
+local default_root = storage .. "/shells/default/configs"
+local default_config = default_root .. "/config/hypr/hyprland.lua"
+local output = storage .. "/keymap/omarchy-keymap.lua"
+
+local function file_exists(path)
+  local file = io.open(path, "r")
+  if file then
+    file:close()
+    return true
+  end
+  return false
+end
+
+local function read_first_line(path)
+  local file = io.open(path, "r")
+  if not file then
+    return nil
+  end
+  local line = file:read("*l")
+  file:close()
+  return line
+end
+
+local function shell_quote(value)
+  return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
+end
+
+if not file_exists(default_config) then
+  io.stderr:write("omarchy-keymap-generate: no default Hyprland config at " .. default_config .. "\n")
+  os.exit(1)
+end
+
+-- Which kind of ricing is this? Omarchy-based ricings keep Omarchy's global
+-- shortcuts as they are; SekaiPop has its own Quickshell IPC; anything else
+-- gets the generic fallbacks.
+local kind
+if file_exists(shell_root .. "/config/omarchy") then
+  kind = "omarchy"
+elseif shell == "sekaipop" or file_exists(shell_root .. "/config/quickshell/sekaipop/shell.qml") then
+  kind = "sekaipop"
+elseif shell == "edgerunners"
+  or (file_exists(shell_root .. "/config/quickshell/launcher/shell.qml")
+    and file_exists(shell_root .. "/config/waybar/config.jsonc")) then
+  kind = "edgerunners"
+else
+  kind = "generic"
+end
+
+-- The Quickshell config name, so the IPC commands follow custom/variables.lua.
+local qs_config = nil
+for _, relative in ipairs({ "config/hypr/hyprland/variables.lua", "config/hypr/custom/variables.lua" }) do
+  local path = shell_root .. "/" .. relative
+  local file = io.open(path, "r")
+  if file then
+    local text = file:read("*a") or ""
+    file:close()
+    local value = text:match('^[ \t]*qsConfig[ \t]*=[ \t]*"([^"]*)"')
+    if value and value ~= "" then
+      qs_config = value
+    end
+  end
+end
+if not qs_config and file_exists(shell_root .. "/config/quickshell/" .. shell .. "/shell.qml") then
+  qs_config = shell
+end
+if not qs_config then
+  qs_config = shell
+end
+
+local ipc = "qs -c " .. qs_config .. " ipc call "
+
+-- ---------------------------------------------------------------------------
+-- Scan the stored default config with a recording `hl`.
+-- ---------------------------------------------------------------------------
+
+local function lua_literal(value)
+  local value_type = type(value)
+
+  if value_type == "string" then
+    return string.format("%q", value)
+  elseif value_type == "number" or value_type == "boolean" then
+    return tostring(value)
+  elseif value_type == "table" then
+    local parts, keys = {}, {}
+    local array_length = #value
+
+    for index = 1, array_length do
+      parts[#parts + 1] = lua_literal(value[index])
+    end
+
+    for key in pairs(value) do
+      if not (type(key) == "number" and key >= 1 and key <= array_length and math.floor(key) == key) then
+        keys[#keys + 1] = key
+      end
+    end
+
+    table.sort(keys, function(left, right)
+      return tostring(left) < tostring(right)
+    end)
+
+    for _, key in ipairs(keys) do
+      local prefix
+      if type(key) == "string" and key:match("^[%a_][%w_]*$") then
+        prefix = key .. " = "
+      else
+        prefix = "[" .. lua_literal(key) .. "] = "
+      end
+      parts[#parts + 1] = prefix .. lua_literal(value[key])
+    end
+
+    return "{ " .. table.concat(parts, ", ") .. " }"
+  end
+
+  return "nil"
+end
+
+local function call_expression(path, ...)
+  local args = {}
+  for index = 1, select("#", ...) do
+    args[index] = lua_literal(select(index, ...))
+  end
+  return path .. "(" .. table.concat(args, ", ") .. ")"
+end
+
+local function dispatcher(kind_name, argument, expression)
+  return {
+    __keymap_dispatcher = true,
+    kind = kind_name or "",
+    arg = argument or "",
+    expr = expression or "",
+  }
+end
+
+local function dsp_proxy(path)
+  return setmetatable({ path = path }, {
+    __index = function(self, key)
+      return dsp_proxy(self.path .. "." .. tostring(key))
+    end,
+    __call = function(self, ...)
+      local first = ...
+      local expression = call_expression(self.path, ...)
+
+      if self.path == "hl.dsp.exec_cmd" and type(first) == "string" then
+        return dispatcher("exec", first, expression)
+      end
+
+      return dispatcher("lua", expression, expression)
+    end,
+  })
+end
+
+-- A stand-in for every Hyprland value the config reads while we only want its
+-- binds. Loops over it are empty; comparisons and arithmetic stay harmless so
+-- the scan reaches the end of the config.
+local noop
+noop = setmetatable({}, {
+  __index = function(_, key)
+    if type(key) == "number" and key ~= 1 and key ~= 0 then
+      return nil
+    end
+    return noop
+  end,
+  __call = function()
+    return noop
+  end,
+  __len = function()
+    return 0
+  end,
+  __lt = function()
+    return false
+  end,
+  __le = function()
+    return false
+  end,
+  __unm = function()
+    return 0
+  end,
+  __add = function()
+    return 0
+  end,
+  __sub = function()
+    return 0
+  end,
+  __mul = function()
+    return 0
+  end,
+  __div = function()
+    return 0
+  end,
+  __mod = function()
+    return 0
+  end,
+  __idiv = function()
+    return 0
+  end,
+  __pow = function()
+    return 0
+  end,
+  __concat = function(left, right)
+    if rawequal(left, noop) then
+      return tostring(right)
+    end
+    return tostring(left)
+  end,
+  __tostring = function()
+    return ""
+  end,
+})
+
+local raw_ipairs = ipairs
+function ipairs(list)
+  if rawequal(list, noop) then
+    return function() end, list, 0
+  end
+  return raw_ipairs(list)
+end
+
+local function chord_id(keys)
+  local parts = {}
+  for raw_part in tostring(keys or ""):gmatch("[^+]+") do
+    local part = raw_part:gsub("^%s+", ""):gsub("%s+$", ""):upper()
+    if part ~= "" then
+      parts[#parts + 1] = part
+    end
+  end
+  table.sort(parts)
+  return table.concat(parts, "+")
+end
+
+local records = {}
+
+hl = setmetatable({
+  dsp = dsp_proxy("hl.dsp"),
+  bind = function(keys, bind_dispatcher, opts)
+    records[#records + 1] = {
+      keys = tostring(keys or ""),
+      chord = chord_id(keys),
+      dispatcher = bind_dispatcher,
+      opts = opts or {},
+    }
+    return noop
+  end,
+  unbind = function(keys)
+    local chord = chord_id(keys)
+    local kept = {}
+    for _, record in ipairs(records) do
+      if record.chord ~= chord then
+        kept[#kept + 1] = record
+      end
+    end
+    records = kept
+    return noop
+  end,
+  get_config = function()
+    return nil
+  end,
+  config = function()
+    return noop
+  end,
+  get_active_window = function()
+    return nil
+  end,
+  get_active_monitor = function()
+    return nil
+  end,
+  get_monitor = function()
+    return nil
+  end,
+  dispatch = function()
+    return noop
+  end,
+  timer = function()
+    return noop
+  end,
+  on = function()
+    return noop
+  end,
+  layer_rule = function()
+    return noop
+  end,
+  window_rule = function()
+    return noop
+  end,
+  env = function()
+    return noop
+  end,
+  define_submap = function()
+    return noop
+  end,
+  get_current_submap = function()
+    return ""
+  end,
+  exec_cmd = function(command)
+    return dispatcher("exec", command, call_expression("hl.exec_cmd", command))
+  end,
+}, {
+  __index = function()
+    return noop
+  end,
+})
+
+-- The default config's bootstrap resets package.path to ~/.config, which is the
+-- active ricing. Re-prepend the stored default tree after it runs so `hypr.*`
+-- modules come from the default shell rather than the one being switched to.
+local function prepend_scan_path()
+  local root = default_root .. "/config"
+  package.path = root .. "/?.lua;" .. root .. "/?/init.lua;"
+    .. root .. "/hypr/?.lua;" .. root .. "/hypr/?/init.lua;"
+    .. package.path
+end
+prepend_scan_path()
+
+local real_dofile = dofile
+function dofile(path)
+  local result = real_dofile(path)
+  if tostring(path):match("bootstrap%.lua$") then
+    prepend_scan_path()
+  end
+  return result
+end
+
+local scan_ok, scan_err = pcall(dofile, default_config)
+if not scan_ok then
+  io.stderr:write("omarchy-keymap-generate: scan failed: " .. tostring(scan_err) .. "\n")
+  os.exit(1)
+end
+
+-- ---------------------------------------------------------------------------
+-- Translation tables
+-- ---------------------------------------------------------------------------
+
+local sekaipop_global = {
+  ["audio.raise"] = ipc .. "osd volumeUp || wpctl set-volume @DEFAULT_AUDIO_SINK@ 2%+ -l 1.5",
+  ["audio.lower"] = ipc .. "osd volumeDown || wpctl set-volume @DEFAULT_AUDIO_SINK@ 2%-",
+  ["audio.mute-toggle"] = ipc .. "osd toggleMute || wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle",
+  ["brightness.raise"] = ipc .. "osd brightnessUp || brightnessctl s 5%+",
+  ["brightness.lower"] = ipc .. "osd brightnessDown || brightnessctl s 5%-",
+  ["ipc.media.next"] = "playerctl next",
+  ["ipc.media.previous"] = "playerctl previous",
+  ["ipc.media.playPause"] = "playerctl play-pause",
+  ["panel.omarchy.clipboard"] = ipc .. "launcherphone toggleMode clip",
+  ["panel.omarchy.emojis"] = ipc .. "launcherphone toggleMode emoji",
+  ["panel.omarchy.audio"] = ipc .. "quickpanel toggle",
+  ["panel.omarchy.bluetooth"] = ipc .. "quickpanel toggle",
+  ["panel.omarchy.monitor"] = ipc .. "quickpanel toggle",
+  ["panel.omarchy.network"] = ipc .. "quickpanel toggle",
+  ["panel.omarchy.power"] = ipc .. "quickpanel toggle",
+  ["panel.omarchy.clock"] = ipc .. "calendarcard toggle",
+  ["menu.capture"] = ipc .. "region screenshot",
+  ["menu.root"] = ipc .. "quickpanel toggle",
+  ["menu.toggle"] = ipc .. "quickpanel toggle",
+  ["menu.hardware"] = ipc .. "quickpanel toggle",
+  ["menu.system"] = ipc .. "phone go power",
+  ["menu.background"] = ipc .. "wallpaperpicker toggle",
+  ["menu.theme"] = ipc .. "theme toggle",
+}
+
+local generic_global = {
+  ["audio.raise"] = "wpctl set-volume @DEFAULT_AUDIO_SINK@ 2%+ -l 1.5",
+  ["audio.lower"] = "wpctl set-volume @DEFAULT_AUDIO_SINK@ 2%-",
+  ["audio.mute-toggle"] = "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle",
+  ["brightness.raise"] = "brightnessctl s 5%+",
+  ["brightness.lower"] = "brightnessctl s 5%-",
+  ["ipc.media.next"] = "playerctl next",
+  ["ipc.media.previous"] = "playerctl previous",
+  ["ipc.media.playPause"] = "playerctl play-pause",
+}
+
+-- Edgerunners runs its own Quickshell launcher and a media/notification
+-- shell, with waybar for the bar. Only the launcher has a matching IPC.
+local edgerunners_global = {
+  ["audio.raise"] = generic_global["audio.raise"],
+  ["audio.lower"] = generic_global["audio.lower"],
+  ["audio.mute-toggle"] = generic_global["audio.mute-toggle"],
+  ["brightness.raise"] = generic_global["brightness.raise"],
+  ["brightness.lower"] = generic_global["brightness.lower"],
+  ["ipc.media.next"] = generic_global["ipc.media.next"],
+  ["ipc.media.previous"] = generic_global["ipc.media.previous"],
+  ["ipc.media.playPause"] = generic_global["ipc.media.playPause"],
+  ["menu.root"] = "qs -c launcher ipc call launcher toggle",
+  ["menu.toggle"] = "qs -c launcher ipc call launcher toggle",
+  ["menu.hardware"] = "qs -c launcher ipc call launcher toggle",
+}
+
+-- Per-ricing overrides from shells/<shell>/ricing.conf:
+--   bind:<action>=<command>   (or "none" to leave the ricing's own bind)
+-- <action> is an Omarchy shell shortcut (menu.root, ipc.notifications.act,
+-- panel.omarchy.clipboard, audio.raise…) or an exact Omarchy command
+-- (omarchy-toggle-bar, omarchy-system-lock…). They win over the built-in
+-- tables below, for every ricing that does not run the Omarchy shell.
+local meta_binds = {}
+do
+  local file = io.open(storage .. "/shells/" .. shell .. "/ricing.conf", "r")
+  if file then
+    for line in file:lines() do
+      local action, command = line:match("^%s*bind:(.-)%s*=%s*(.-)%s*$")
+      if action and action ~= "" and command and command ~= "" then
+        meta_binds[action] = command
+      end
+    end
+    file:close()
+  end
+end
+local NONE = {}
+
+local function meta_bind(action)
+  local command = meta_binds[action]
+  if command == nil then return nil end
+  if command == "none" then return NONE end
+  return command
+end
+
+-- Commands that open a shell surface are matched by the shortcut name they
+-- stand for, so one `bind:menu.share=` entry covers both forms.
+local function action_for_command(command)
+  local menu = command:match("^omarchy%-menu toggle '?([^' ]+)'?$")
+  if menu then return "menu." .. menu end
+  local panel = command:match("^omarchy%-shell shell toggle '?([^' ]+)'?$")
+  if panel then return "panel." .. panel end
+  local target, method = command:match("^omarchy%-shell '?([^' %-][^' ]*)'? '?([^' ]+)'?$")
+  if target and target ~= "shell" then return "ipc." .. target .. "." .. method end
+  local audio = command:match("^omarchy%-audio%-output%-volume '?([%a%-]+)'?$")
+  if audio then return "audio." .. audio end
+  return nil
+end
+
+local function command_for_global(name)
+  local override = meta_bind(name)
+  if override == NONE then return nil end
+  if override then return override end
+  local table_for_kind
+  if kind == "sekaipop" then
+    table_for_kind = sekaipop_global
+  elseif kind == "edgerunners" then
+    table_for_kind = edgerunners_global
+  else
+    table_for_kind = generic_global
+  end
+  return table_for_kind[name]
+end
+
+local function translate_global(name)
+  if kind == "omarchy" then
+    return 'hl.dsp.global("omarchy:' .. name .. '")'
+  end
+
+  local command = command_for_global(name)
+  if command then
+    return "hl.dsp.exec_cmd(" .. lua_literal(command) .. ")"
+  end
+
+  return nil
+end
+
+local function translate_command(command)
+  if kind == "omarchy" then
+    return command
+  end
+
+  local override = meta_bind(command)
+  if override == nil then
+    local action = action_for_command(command)
+    if action then override = meta_bind(action) end
+  end
+  if override == NONE then return nil end
+  if override then return override end
+
+  -- Audio and brightness through the shell's OSD when it has one, with the
+  -- same direct fallbacks the ricing's own keys use.
+  if command == "omarchy-audio-input-mute" then
+    if kind == "sekaipop" then
+      return ipc .. "osd toggleMicMute || wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle"
+    end
+    return "wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle"
+  end
+
+  if command == "omarchy-audio-output-volume +1" then
+    return "wpctl set-volume @DEFAULT_AUDIO_SINK@ 1%+"
+  end
+  if command == "omarchy-audio-output-volume -1" then
+    return "wpctl set-volume @DEFAULT_AUDIO_SINK@ 1%-"
+  end
+  if command == "omarchy-audio-output-volume raise" then
+    return command_for_global("audio.raise")
+  end
+  if command == "omarchy-audio-output-volume lower" then
+    return command_for_global("audio.lower")
+  end
+  if command == "omarchy-audio-output-volume mute-toggle" then
+    return command_for_global("audio.mute-toggle")
+  end
+
+  if command == "omarchy-brightness-display 100%" then
+    return "brightnessctl s 100%"
+  end
+  if command == "omarchy-brightness-display 1%" then
+    return "brightnessctl s 1%"
+  end
+  if command == "omarchy-brightness-display +1%" then
+    return "brightnessctl s +1%"
+  end
+  if command == "omarchy-brightness-display 1%-" then
+    return "brightnessctl s 1%-"
+  end
+
+  -- Shell-owned actions with no equivalent in the target ricing are skipped:
+  -- the ricing's own binding (if any) stays in place.
+  if command == "omarchy-system-lock" then
+    if kind == "sekaipop" then
+      return ipc .. "lock lock || loginctl lock-session"
+    end
+    return "loginctl lock-session"
+  end
+
+  if command == "omarchy-toggle-bar" then
+    if kind == "sekaipop" then
+      return ipc .. "bar toggle"
+    end
+    return nil
+  end
+
+  if command == "omarchy-shell omarchy.dock apps" then
+    if kind == "sekaipop" then
+      return ipc .. "launcherphone toggle"
+    end
+    if kind == "edgerunners" then
+      return "qs -c launcher ipc call launcher toggle"
+    end
+    return nil
+  end
+
+  if command == "omarchy-menu-keybindings" then
+    if kind == "sekaipop" then
+      return ipc .. "cheatsheet toggle"
+    end
+    return nil
+  end
+
+  -- These open Omarchy's interactive menu, which forwards to the running
+  -- Omarchy shell. Without that shell there is nothing to show.
+  if command == "omarchy-menu-tmux-keybindings" or command == "omarchy-menu-herdr-keybindings" then
+    return nil
+  end
+
+  if command == "omarchy-notification-weather" then
+    if kind == "sekaipop" then
+      return ipc .. "weathercard toggle"
+    end
+    return nil
+  end
+
+  if command == "omarchy-toggle-idle" then
+    if kind == "sekaipop" then
+      return ipc .. "quickpanel keepAwake"
+    end
+    return nil
+  end
+
+  if command == "omarchy-capture-screenrecording --stop-recording || omarchy-menu toggle trigger.capture.screenrecord" then
+    if kind == "sekaipop" then
+      return ipc .. "region toggleRecord"
+    end
+    return "omarchy-capture-screenrecording --stop-recording || omarchy-capture-screenrecording"
+  end
+
+  if command:match("^omarchy%-shell[ %s]") then
+    return nil
+  end
+  if command:match("^omarchy%-menu[ %s]") then
+    return nil
+  end
+  if command == "omarchy-audio-source-switch" then
+    return nil
+  end
+  if command == "omarchy-input-method cycle" or command == "omarchy-input-method cycle back" then
+    return nil
+  end
+  if command == "omarchy-toggle-notification-silencing"
+    or command == "omarchy-toggle-fullscreen-desktop"
+    or command == "omarchy-transcode"
+    or command == "omarchy-agent --pick"
+    or command == "omarchy-reminder show"
+    or command == "omarchy-reminder clear" then
+    return nil
+  end
+
+  return command
+end
+
+local function translate_expression(expression)
+  local global_name = expression:match('^hl%.dsp%.global%("omarchy:([^"]+)"%)$')
+  if global_name then
+    return translate_global(global_name)
+  end
+
+  local slot = expression:match("^o%.workspaces%.focus%((%d+)%)$")
+  if slot then
+    return "hl.dsp.focus({ workspace = " .. slot .. " })"
+  end
+
+  slot = expression:match("^o%.workspaces%.move_window%((%d+), false%)$")
+  if slot then
+    return "hl.dsp.window.move({ workspace = " .. slot .. ", follow = false })"
+  end
+
+  slot = expression:match("^o%.workspaces%.move_window%((%d+)%)$")
+  if slot then
+    return "hl.dsp.window.move({ workspace = " .. slot .. " })"
+  end
+
+  local direction = expression:match('^o%.workspaces%.move_to_monitor%("([lrud])"%)$')
+  if direction then
+    return 'function() workspace_to_monitor("' .. direction .. '") end'
+  end
+
+  direction = expression:match('^o%.workspaces%.move_window_to_monitor%("([lrud])"%)$')
+  if direction then
+    return 'function() window_to_monitor("' .. direction .. '") end'
+  end
+
+  return expression
+end
+
+-- Function binds have no command for the keybindings menu to replay, so they
+-- are rebuilt from their description.
+local function translate_function(description)
+  if description == "Select all" then
+    return 'function() send_shortcut_once("CTRL", "A")() end'
+  end
+  if description == "Universal copy" then
+    return 'function() universal_clipboard_shortcut("CTRL", "C", "CTRL SHIFT", "C")() end'
+  end
+  if description == "Universal paste" then
+    return 'function() universal_clipboard_shortcut("CTRL", "V", "CTRL SHIFT", "V")() end'
+  end
+  if description == "Universal cut" then
+    return 'function() send_shortcut_once("CTRL", "X")() end'
+  end
+  if description == "Direct input for the terminal prefix" then
+    return 'function() if active_window_is_terminal() then shell_succeeds("timeout 0.3 fcitx5-remote --check -c") end end'
+  end
+  if description == "Zoom in" then
+    return 'function() local zoom = hl.get_config("cursor.zoom_factor") or 1; hl.config({ cursor = { zoom_factor = zoom + 1 } }) end'
+  end
+  if description == "Reset zoom" then
+    return 'function() hl.config({ cursor = { zoom_factor = 1 } }) end'
+  end
+
+  -- Superwhisper owns its shortcuts file, loaded below.
+  if description and description:match("^Superwhisper:") then
+    return nil
+  end
+
+  return nil
+end
+
+-- ---------------------------------------------------------------------------
+-- Build the overlay
+-- ---------------------------------------------------------------------------
+
+local translated = {}
+
+for _, record in ipairs(records) do
+  -- Lid and other device switches are not keyboard shortcuts; the ricing's own
+  -- power management should keep handling them.
+  if not record.chord:match("^SWITCH:") then
+    local description = record.opts.description
+    local expression = nil
+
+    if type(record.dispatcher) == "table" and record.dispatcher.__keymap_dispatcher then
+      if record.dispatcher.kind == "exec" then
+        local command = translate_command(record.dispatcher.arg)
+        if command then
+          expression = "hl.dsp.exec_cmd(" .. lua_literal(command) .. ")"
+        end
+      else
+        expression = translate_expression(record.dispatcher.arg)
+      end
+    elseif type(record.dispatcher) == "string" and record.dispatcher ~= "" then
+      local command = translate_command(record.dispatcher)
+      if command then
+        expression = "hl.dsp.exec_cmd(" .. lua_literal(command) .. ")"
+      end
+    elseif type(record.dispatcher) == "function" then
+      local command = o and o.bind_commands and o.bind_commands[record.dispatcher]
+      local lua_expression = o and o.bind_expressions and o.bind_expressions[record.dispatcher]
+      if command then
+        local translated_command = translate_command(command)
+        if translated_command then
+          expression = "hl.dsp.exec_cmd(" .. lua_literal(translated_command) .. ")"
+        end
+      elseif lua_expression then
+        expression = translate_expression(lua_expression)
+      else
+        expression = translate_function(description)
+      end
+    end
+
+    if expression then
+      translated[#translated + 1] = {
+        keys = record.keys,
+        chord = record.chord,
+        opts = record.opts,
+        expr = expression,
+        release = record.opts.release == true,
+      }
+    end
+  end
+end
+
+-- Pair the press and release halves of o.bind_hold. The press starts the hold;
+-- the release only runs when its own press did, exactly like o.bind_hold.
+local last_press = {}
+for index, record in ipairs(translated) do
+  if record.release then
+    local press_index = last_press[record.chord]
+    if press_index then
+      translated[press_index].hold_press = true
+      record.hold_release = true
+      last_press[record.chord] = nil
+    end
+  else
+    last_press[record.chord] = index
+  end
+end
+
+local final = {}
+for _, record in ipairs(translated) do
+  -- A release half whose press was skipped would run the stop action with no
+  -- start; drop it instead.
+  if not record.release or record.hold_release then
+    final[#final + 1] = record
+  end
+end
+
+local lines = {}
+local function add(line)
+  lines[#lines + 1] = line
+end
+
+add("-- Generated by omarchy-keymap-generate for the '" .. shell .. "' ricing.")
+add("-- Source: " .. default_config)
+add("-- Do not edit: hypr-switch regenerates this file on every switch.")
+add("")
+add("local home = os.getenv(\"HOME\") or \"\"")
+add("local current = \"\"")
+add("do")
+add("  local file = io.open(home .. \"/.hypr-switch/.current_shell\", \"r\")")
+add("  if file then")
+add("    current = file:read(\"*l\") or \"\"")
+add("    file:close()")
+add("  end")
+add("end")
+add("if current ~= " .. lua_literal(shell) .. " then return end")
+add("")
+add("local function shell_succeeds(command)")
+add("  local pipe = io.popen(\"( \" .. command .. \" ) >/dev/null 2>&1 && echo OK\")")
+add("  if not pipe then return false end")
+add("  local output = pipe:read(\"*a\") or \"\"")
+add("  pipe:close()")
+add("  return output:find(\"OK\", 1, true) ~= nil")
+add("end")
+add("")
+add("local function active_window_is_terminal()")
+add("  local window = hl.get_active_window()")
+add("  if not window then return false end")
+add("  for _, tag in ipairs(window.tags or {}) do")
+add("    if tag:gsub(\"%*$\", \"\") == \"terminal\" then return true end")
+add("  end")
+add("  return false")
+add("end")
+add("")
+add("local function send_shortcut_once(mods, key)")
+add("  return function()")
+add("    hl.dispatch(hl.dsp.send_key_state({ mods = mods, key = key, state = \"down\" }))")
+add("    hl.timer(function()")
+add("      hl.dispatch(hl.dsp.send_key_state({ mods = mods, key = key, state = \"up\" }))")
+add("    end, { timeout = 50, type = \"oneshot\" })")
+add("  end")
+add("end")
+add("")
+add("local function universal_clipboard_shortcut(default_mods, default_key, terminal_mods, terminal_key)")
+add("  return function()")
+add("    if active_window_is_terminal() then")
+add("      send_shortcut_once(terminal_mods, terminal_key)()")
+add("    else")
+add("      send_shortcut_once(default_mods, default_key)()")
+add("    end")
+add("  end")
+add("end")
+add("")
+add("local function workspace_to_monitor(direction)")
+add("  local target = hl.get_monitor(direction)")
+add("  if target then hl.dispatch(hl.dsp.workspace.move({ monitor = target.name })) end")
+add("end")
+add("")
+add("local function window_to_monitor(direction)")
+add("  local target = hl.get_monitor(direction)")
+add("  if target then hl.dispatch(hl.dsp.window.move({ monitor = target.name })) end")
+add("end")
+add("")
+add("local held = {}")
+add("local function run_action(action)")
+add("  if type(action) == \"function\" then action() else hl.dispatch(action) end")
+add("end")
+add("local function hold_press(chord, action)")
+add("  held[chord] = true")
+add("  run_action(action)")
+add("end")
+add("local function hold_release(chord, action)")
+add("  if held[chord] then")
+add("    held[chord] = nil")
+add("    run_action(action)")
+add("  end")
+add("end")
+add("")
+
+if kind ~= "omarchy" then
+  add("-- Omarchy loads the selected dictation backend's own integration; other")
+  add("-- ricings need it loaded here so Superwhisper keeps its keys.")
+  add("do")
+  add("  local integration = home .. \"/.config/superwhisper/shortcuts.lua\"")
+  add("  local file = io.open(integration, \"r\")")
+  add("  if file then")
+  add("    file:close()")
+  add("    package.loaded[\"superwhisper.shortcuts\"] = nil")
+  add("    local ok, err = pcall(dofile, integration)")
+  add("    if not ok then")
+  add("      print(\"[hypr-switch] Superwhisper shortcuts failed: \" .. tostring(err))")
+  add("    end")
+  add("  end")
+  add("end")
+  add("")
+end
+
+add("-- Binds are applied after the ricing's own, so Omarchy's keymap wins a")
+add("-- shared chord. Unbind once per chord: duplicate Omarchy binds must all")
+add("-- survive, and an unbind before each would remove the previous one.")
+local unbound = {}
+for _, record in ipairs(final) do
+  if not unbound[record.chord] then
+    add("hl.unbind(" .. lua_literal(record.keys) .. ")")
+    unbound[record.chord] = true
+  end
+
+  local expression = record.expr
+  if record.hold_press then
+    expression = "function() hold_press(" .. lua_literal(record.chord) .. ", " .. expression .. ") end"
+  elseif record.hold_release then
+    expression = "function() hold_release(" .. lua_literal(record.chord) .. ", " .. expression .. ") end"
+  end
+
+  add("hl.bind(" .. lua_literal(record.keys) .. ", " .. expression .. ", " .. lua_literal(record.opts) .. ")")
+end
+
+add("")
+add("print(" .. lua_literal("[hypr-switch] Omarchy keymap overlay applied for " .. shell .. " (" .. #final .. " binds)") .. ")")
+
+-- ---------------------------------------------------------------------------
+-- Write atomically
+-- ---------------------------------------------------------------------------
+
+local directory = storage .. "/keymap"
+os.execute("mkdir -p " .. shell_quote(directory))
+
+local temporary = output .. ".tmp." .. tostring(os.time())
+local file, open_error = io.open(temporary, "w")
+if not file then
+  io.stderr:write("omarchy-keymap-generate: cannot write " .. temporary .. ": " .. tostring(open_error) .. "\n")
+  os.exit(1)
+end
+
+file:write(table.concat(lines, "\n"), "\n")
+file:close()
+
+local renamed, rename_error = os.rename(temporary, output)
+if not renamed then
+  os.remove(temporary)
+  io.stderr:write("omarchy-keymap-generate: cannot replace " .. output .. ": " .. tostring(rename_error) .. "\n")
+  os.exit(1)
+end
+
+io.stdout:write("omarchy-keymap: " .. tostring(#final) .. " binds for " .. shell .. " (" .. kind .. ")\n")

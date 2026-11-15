@@ -1,0 +1,2551 @@
+#!/usr/bin/env bash
+#
+# ricing-switch — capture-based, multi-app config switcher for Hyprland,
+# KDE Plasma, Sway, Niri and other desktop sessions.
+# (Based on hypr-switch: https://github.com/bobincraft1/hypr-switch)
+#
+# Architecture summary (see README for full detail):
+#   ~/.hypr-switch/                     <- all storage lives here, OUTSIDE ~/.config
+#     shells/<name>/configs/
+#       config/<app>/...                <- mirrors things under ~/.config
+#       home/<dotfile-or-dir>/...       <- mirrors a curated set of dotfiles in $HOME
+#       local/<item>/...                <- mirrors curated ~/.local/share subdirs
+#     .current_shell
+#     .capture_state/                   <- only exists while a capture is in progress
+#
+# Every top-level entry under ~/.config, and every curated dotfile under $HOME
+# that hypr-switch manages, is ALWAYS a symlink into shells/<owner>/configs/.
+# Only SWITCHABLE_CONFIG_ITEMS (hypr, quickshell, bars, terminals, lock/idle,
+# GTK/Qt themes…) and SWITCHABLE_LOCAL_ITEMS (fonts) follow the active ricing;
+# every other unit is permanently owned by the "default" shell so apps, files,
+# accounts and app data never change when the interface does. This script is
+# the only thing that should ever create/remove those symlinks.
+#
+# Switching is live by default: the old shell is stopped, links are
+# reconciled, Hyprland reloads, and the new shell starts — open windows stay
+# open. `--logout <name>` keeps the old log-out path, and `--repair`
+# reconciles links without restarting anything.
+#
+# Usage:
+#   ricing switch                     interactive picker (rofi or terminal)
+#   ricing switch <name>              switch to ricing <name>
+#   ricing switch --logout <name>     switch with a full logout
+#   ricing switch --repair            reconcile links, no shell restart
+#   ricing switch --list              list discovered ricings
+#   ricing switch --reload            reload current config, no logout
+#   ricing switch --help              show usage
+#   ricing switch bootstrap           one-time whole-~/.config capture as 'default'
+#   ricing switch capture-start <name>  begin capturing a new/updated ricing
+#   ricing switch capture-finish <name> finish capturing, diff, claim, symlink
+#   ricing switch capture-cancel        abort an in-progress capture, restore everything
+#   ricing switch capture-status        show whether a capture is in progress
+#   ricing switch show <name>           list what a ricing owns
+#
+# --- Bash self-guard --------------------------------------------------------
+# This script requires real bash: associative arrays, substring expansion,
+# process substitution, and nameref variables are all used below and are NOT
+# available under a POSIX /bin/sh. If invoked via sh (which can happen
+# depending on how a caller spawns commands, regardless of this file's own
+# shebang), re-exec under a real bash before anything else runs, rather than
+# fail with a cryptic "Bad substitution" partway through.
+if [ -z "${BASH_VERSION:-}" ]; then
+    if command -v bash >/dev/null 2>&1; then
+        exec bash "$0" "$@"
+    else
+        echo "ricing-switch requires bash, but bash was not found on PATH." >&2
+        exit 1
+    fi
+fi
+# -----------------------------------------------------------------------------
+
+set -uo pipefail
+
+# dotglob: makes bare `*` globs match dotfiles too (e.g. .zshrc), which every
+# entry in WATCHED_HOME_ITEMS is. Without this, `for entry in "$dir"/*` would
+# silently skip every home-scope item in list_shell_items and elsewhere —
+# confirmed as a real bug during testing, not a hypothetical. This does NOT
+# make globs match "." or ".." themselves (verified empirically) — safe.
+shopt -s dotglob
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+STORAGE_ROOT="$HOME/.hypr-switch"
+SHELLS_DIR="$STORAGE_ROOT/shells"
+CURRENT_SHELL_FILE="$STORAGE_ROOT/.current_shell"
+CAPTURE_STATE_DIR="$STORAGE_ROOT/.capture_state"
+CANCELLED_HOLDING_DIR="$STORAGE_ROOT/.cancelled"
+CONFIG_DIR="$HOME/.config"
+LOCAL_SHARE_DIR="$HOME/.local/share"
+
+# Shared Omarchy keymap overlay. The generator reads the stored "default"
+# (Omarchy) shell, translates shell-owned actions for the target ricing, and
+# writes one overlay that every non-default ricing loads last.
+KEYMAP_DIR="$STORAGE_ROOT/keymap"
+KEYMAP_GENERATOR="$HOME/.local/bin/omarchy-keymap-generate"
+KEYMAP_MARKER="hypr-switch: Omarchy keymap overlay"
+MENU_THEME="$STORAGE_ROOT/ricing-menu.rasi"
+
+# notify-send blocks for the D-Bus activation timeout when the active ricing
+# has no notification daemon yet (a live switch starts only its main shell).
+# Keep every notification best-effort so a switch or reload never hangs.
+notify() {
+    timeout 2 notify-send "ricing" "$@" 2>/dev/null || true
+}
+
+# Curated, explicit list of dotfiles/dirs directly under $HOME that hypr-switch
+# is willing to watch and capture. This list is intentionally NOT "scan
+# everything in $HOME" — see the denylist below and the README for why.
+# Safe to edit: add or remove entries as your shells actually need.
+WATCHED_HOME_ITEMS=(
+    ".zshrc"
+    ".bashrc"
+    ".zshenv"
+    ".bash_profile"
+    ".themes"
+    ".icons"
+    ".fonts"
+    ".Xresources"
+    ".xinitrc"
+    ".vimrc"
+    ".gtkrc-2.0"
+)
+
+# Curated subdirectories of ~/.local/share that hypr-switch is willing to
+# watch and capture. Theme/icon/font installers routinely drop files here
+# (e.g. .local/share/themes/<name>/...), and like WATCHED_HOME_ITEMS this
+# list is explicit and never auto-scanned — ~/.local/share contains plenty
+# of app-specific data (browser profiles, game saves, caches) that must
+# never be swept into a capture.
+WATCHED_LOCAL_ITEMS=(
+    "themes"
+    "icons"
+    "fonts"
+)
+
+# Local resources that may follow a ricing. Only items the "default" shell
+# already owns can safely be switchable: a target that owns one applies its
+# snapshot, and every other ricing falls back to default's copy. Fonts are
+# captured by bootstrap, so a ricing can bring its own font set without
+# losing the default one.
+SWITCHABLE_LOCAL_ITEMS=(
+    "fonts"
+)
+
+# Only these top-level ~/.config items are desktop-interface state and are
+# therefore allowed to differ between ricing shells. Everything else (app
+# configs, browser/chat profiles, systemd units, credentials…) is permanently
+# owned by the "default" shell, so switching a ricing changes the interface
+# only — never the apps, files, accounts or app data underneath it.
+# Units in home/* are always shared/default. Most local/* items are too;
+# SWITCHABLE_LOCAL_ITEMS lists the exceptions (fonts).
+SWITCHABLE_CONFIG_ITEMS=(
+    # Hyprland / Wayland ricings
+    "hypr"
+    "quickshell"
+    "sekaipop"
+    "omarchy"
+    "waybar"
+    "rofi"
+    "wofi"
+    "fuzzel"
+    "anyrun"
+    "mako"
+    "dunst"
+    "swaync"
+    "ags"
+    "eww"
+    "hyprpanel"
+    "nwg-panel"
+    "hypridle"
+    "hyprlock"
+    "hyprpaper"
+    "swww"
+    "swaybg"
+    # Terminal emulators — their colours and effects belong to the ricing,
+    # not to the Omarchy/default shell (e.g. a terminal shader or cursor trail
+    # must not follow another ricing).
+    "kitty"
+    "ghostty"
+    "alacritty"
+    "foot"
+    # Toolkit / theme settings shared by the desktop
+    "gtk-2.0"
+    "gtk-3.0"
+    "gtk-4.0"
+    "qt5ct"
+    "qt6ct"
+    "Kvantum"
+    "xsettingsd"
+    # KDE Plasma (Plasma 6 keeps most desktop state in these files/dirs)
+    "kdeglobals"
+    "plasmarc"
+    "plasmashellrc"
+    "plasma-org.kde.plasma.desktop-appletsrc"
+    "plasma-workspace"
+    "kwinrc"
+    "kwinrulesrc"
+    "kglobalshortcutsrc"
+    "khotkeysrc"
+    "konsolerc"
+    "kscreenlockerrc"
+    "ksmserverrc"
+    "kaccessrc"
+    "krunnerrc"
+    "powerdevilrc"
+    "systemsettingsrc"
+    "aurorae"
+    "color-schemes"
+)
+
+# Hard denylist — these are NEVER captured under any circumstances, even if
+# accidentally added to WATCHED_HOME_ITEMS above. This is a backstop, not the
+# primary safety mechanism (the primary mechanism is that WATCHED_HOME_ITEMS
+# is curated and $HOME is never scanned wholesale).
+DENYLIST_HOME_ITEMS=(
+    ".ssh" ".gnupg" ".gpg" ".password-store" ".aws" ".gcloud" ".kube"
+    ".netrc" ".git-credentials" ".docker" ".hypr-switch"
+)
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+is_denied_home_item() {
+    local item_name="$1" d
+    for d in "${DENYLIST_HOME_ITEMS[@]}"; do
+        [[ "$item_name" == "$d" ]] && return 0
+    done
+    local lower="${item_name,,}"
+    case "$lower" in
+        *key*|*credential*|*secret*|*token*) return 0 ;;
+    esac
+    return 1
+}
+
+# scoped path examples: "config/kitty/kitty.conf", "home/.zshrc", "home/.themes/pack/gtk.css"
+# claim unit examples:  "config/kitty",             "home/.zshrc", "home/.themes"
+claim_unit_of() {
+    local scoped_path="$1"
+    local scope="${scoped_path%%/*}"
+    local rest="${scoped_path#*/}"
+    local second="${rest%%/*}"
+    printf '%s/%s' "$scope" "$second"
+}
+
+# claim unit -> real filesystem path ("config/kitty" -> $HOME/.config/kitty,
+# "home/.zshrc" -> $HOME/.zshrc)
+scoped_path_to_real_path() {
+    local scoped_path="$1"
+    local scope="${scoped_path%%/*}"
+    local rest="${scoped_path#*/}"
+    if [[ "$scope" == "config" ]]; then
+        printf '%s/%s' "$CONFIG_DIR" "$rest"
+    elif [[ "$scope" == "home" ]]; then
+        printf '%s/%s' "$HOME" "$rest"
+    elif [[ "$scope" == "local" ]]; then
+        printf '%s/%s' "$LOCAL_SHARE_DIR" "$rest"
+    else
+        return 1
+    fi
+}
+
+# True when a claim unit is interface-only and may follow the target ricing.
+# Everything else is pinned to the "default" shell.
+is_switchable_unit() {
+    local unit="$1"
+    local scope="${unit%%/*}"
+    local item="${unit#*/}"
+    [[ "$item" == */* ]] && return 1
+    local s
+    case "$scope" in
+        config)
+            for s in "${SWITCHABLE_CONFIG_ITEMS[@]}"; do
+                [[ "$item" == "$s" ]] && return 0
+            done
+            ;;
+        local)
+            for s in "${SWITCHABLE_LOCAL_ITEMS[@]}"; do
+                [[ "$item" == "$s" ]] && return 0
+            done
+            ;;
+    esac
+    return 1
+}
+
+# True when shells/<name>/configs contains the given claim unit.
+shell_owns_unit() {
+    local shell_name="$1" unit="$2"
+    local p="$SHELLS_DIR/$shell_name/configs/$unit"
+    [[ -e "$p" || -L "$p" ]]
+}
+
+# A unit follows a ricing when it is interface state (is_switchable_unit) or
+# when it is private to that ricing: a config/<item> the default shell does
+# not own, named after the ricing or listed in its ricing.conf `private=`
+# (e.g. config/nebula, config/matugen). Default never uses it, so letting it
+# follow the ricing cannot hide app data. Anything else stays shared.
+is_ricing_unit() {
+    local shell_name="$1" unit="$2" item line p
+    is_switchable_unit "$unit" && return 0
+    [[ "$shell_name" == "default" ]] && return 1
+    [[ "${unit%%/*}" == "config" && "${unit#*/}" != */* ]] || return 1
+    shell_owns_unit "default" "$unit" && return 1
+    item="${unit#config/}"
+    [[ "${item,,}" == "${shell_name,,}" ]] && return 0
+    while IFS= read -r line; do
+        for p in $line; do
+            [[ "$p" == "$item" ]] && return 0
+        done
+    done < <(shell_meta_values "$shell_name" private)
+    return 1
+}
+
+# Ricing metadata: shells/<name>/ricing.conf, key=value lines, repeatable
+# keys (start=, stop=, packages=, aur=, setup=, bind:<action>=). Read by
+# ricing-switch (live start/stop), the hypr-switch Lua lib (login autostart),
+# omarchy-keymap-generate (bind: overrides) and `ricing deps`.
+shell_meta_file() {
+    printf '%s' "$SHELLS_DIR/$1/ricing.conf"
+}
+
+shell_meta_values() {
+    local shell_name="$1" key="$2" file line k v
+    file="$(shell_meta_file "$shell_name")"
+    [[ -f "$file" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" == *=* ]] || continue
+        k="${line%%=*}"; v="${line#*=}"
+        k="${k#"${k%%[![:space:]]*}"}"; k="${k%"${k##*[![:space:]]}"}"
+        v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+        [[ "$k" == "$key" && -n "$v" ]] && printf '%s\n' "$v"
+    done < "$file"
+}
+
+shell_meta_value() {
+    shell_meta_values "$1" "$2" | tail -n1
+}
+
+# Packages a ricing declares (packages= and aur=) that are not installed.
+shell_missing_packages() {
+    local shell_name="$1" line pkg
+    command -v pacman >/dev/null 2>&1 || return 0
+    while IFS= read -r line; do
+        for pkg in $line; do
+            pacman -T "$pkg" >/dev/null 2>&1 || printf '%s\n' "$pkg"
+        done
+    done < <(shell_meta_values "$shell_name" packages; shell_meta_values "$shell_name" aur)
+}
+
+# True when the link at $1 was created by hypr-switch (points into storage),
+# including dangling links whose target no longer exists.
+is_managed_link() {
+    local link="$1" raw resolved
+    [[ -L "$link" ]] || return 1
+    raw="$(readlink "$link" 2>/dev/null || true)"
+    resolved="$(readlink -f "$link" 2>/dev/null || true)"
+    [[ -n "$resolved" && "$resolved" == "$STORAGE_ROOT"/* ]] && return 0
+    case "$raw" in
+        "$STORAGE_ROOT"/*|*"/.hypr-switch/"*) return 0 ;;
+    esac
+    return 1
+}
+
+# Quickshell config name declared by a shell, if it uses Quickshell directly.
+# Omarchy's shell lives in /usr/share/omarchy and is started by its launcher,
+# so it has no config/quickshell entry in storage.
+shell_quickconfig_name() {
+    local shell_name="$1"
+    local base="$SHELLS_DIR/$shell_name/configs"
+    local f qs="" d
+    for f in "$base/config/hypr/hyprland/variables.lua" "$base/config/hypr/custom/variables.lua"; do
+        [[ -f "$f" ]] || continue
+        qs="$(sed -n 's/^[[:space:]]*qsConfig[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n1)"
+        [[ -n "$qs" ]] && break
+    done
+    if [[ -z "$qs" && -d "$base/config/quickshell" ]]; then
+        for d in "$base/config/quickshell"/*/; do
+            [[ -f "$d/shell.qml" ]] && { qs="$(basename "$d")"; break; }
+        done
+    fi
+    printf '%s' "$qs"
+}
+
+shell_uses_hypridle() {
+    local shell_name="$1"
+    [[ -f "$SHELLS_DIR/$shell_name/configs/config/hypr/hypridle.conf" ]]
+}
+
+# Which session does a stored ricing belong to? Detection is based on the
+# captured config, not on what is installed right now, so a Plasma ricing can
+# be captured from Hyprland (and vice versa) and still switch correctly.
+shell_session_type() {
+    local shell_name="$1"
+    local base="$SHELLS_DIR/$shell_name/configs/config"
+    if [[ -d "$base/hypr" ]]; then
+        printf 'hyprland'
+    elif [[ -e "$base/kdeglobals" || -e "$base/kwinrc" || -e "$base/plasmarc" \
+         || -e "$base/plasmashellrc" || -e "$base/plasma-workspace" \
+         || -e "$base/plasma-org.kde.plasma.desktop-appletsrc" ]]; then
+        printf 'plasma'
+    elif [[ -d "$base/sway" ]]; then
+        printf 'sway'
+    elif [[ -d "$base/niri" ]]; then
+        printf 'niri'
+    elif [[ -d "$base/xfce4" || -d "$base/xfconf" ]]; then
+        printf 'xfce'
+    elif compgen -G "$base/gnome*" >/dev/null 2>&1 || [[ -d "$base/dconf" ]]; then
+        printf 'gnome'
+    else
+        printf 'other'
+    fi
+}
+
+# Which session are we running in right now? Used to decide whether a live
+# switch is possible or whether the logout path is required.
+current_session_type() {
+    local desktop="${XDG_CURRENT_DESKTOP:-}"
+    if [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] || [[ "$desktop" == *Hyprland* ]]; then
+        printf 'hyprland'
+    elif [[ -n "${KDE_FULL_SESSION:-}" ]] || [[ "$desktop" == *KDE* || "$desktop" == *Plasma* ]]; then
+        printf 'plasma'
+    elif [[ "$desktop" == *sway* ]]; then
+        printf 'sway'
+    elif [[ "$desktop" == *niri* ]]; then
+        printf 'niri'
+    elif [[ "$desktop" == *XFCE* ]]; then
+        printf 'xfce'
+    elif [[ "$desktop" == *GNOME* ]]; then
+        printf 'gnome'
+    else
+        printf 'unknown'
+    fi
+}
+
+session_type_label() {
+    case "$1" in
+        hyprland) printf 'Hyprland' ;;
+        plasma)   printf 'Plasma' ;;
+        sway)     printf 'Sway' ;;
+        niri)     printf 'Niri' ;;
+        xfce)     printf 'XFCE' ;;
+        gnome)    printf 'GNOME' ;;
+        *)        printf 'Autre' ;;
+    esac
+}
+
+# True when the stored ricing belongs to the session we are running in, so a
+# reload/reconfigure makes sense. A Plasma ricing repaired from Hyprland must
+# not trigger a Hyprland reload with Plasma links in place.
+session_matches_shell() {
+    local shell_name="$1" shell_type session_type
+    shell_type="$(shell_session_type "$shell_name")"
+    session_type="$(current_session_type)"
+    if command -v hyprctl >/dev/null 2>&1 && hyprctl version >/dev/null 2>&1; then
+        session_type="hyprland"
+    fi
+    [[ "$shell_type" == "$session_type" ]]
+}
+
+# Reload the current session's config without logging out. Hyprland gets a
+# normal reload; Plasma gets a KWin reconfigure plus a plasmashell restart.
+reload_current_session() {
+    if command -v hyprctl >/dev/null 2>&1 && hyprctl version >/dev/null 2>&1; then
+        if hyprctl reload >/dev/null 2>&1; then
+            return 0
+        fi
+        if hyprctl dispatch 'hl.dsp.reload()' >/dev/null 2>&1; then
+            return 0
+        fi
+        return 1
+    fi
+
+    if [[ "$(current_session_type)" == "plasma" ]]; then
+        local reloaded=0
+        if command -v qdbus6 >/dev/null 2>&1; then
+            qdbus6 org.kde.KWin /KWin reconfigure >/dev/null 2>&1 && reloaded=1
+        elif command -v qdbus >/dev/null 2>&1; then
+            qdbus org.kde.KWin /KWin reconfigure >/dev/null 2>&1 && reloaded=1
+        fi
+        if command -v kbuildsycoca6 >/dev/null 2>&1; then
+            kbuildsycoca6 --noincremental >/dev/null 2>&1 || true
+        fi
+        if pgrep -x plasmashell >/dev/null 2>&1; then
+            setsid plasmashell --replace >/dev/null 2>&1 &
+            reloaded=1
+        fi
+        (( reloaded )) && return 0
+    fi
+    return 1
+}
+
+# Computes a RELATIVE symlink target for a link living at link_path that
+# should point at target. Both may be absolute; the result is relative from
+# link_path's parent directory to target. Relative links keep ~/.hypr-switch
+# relocatable (moving/copying $HOME keeps every symlink valid) and work when
+# $HOME itself is reached through a symlink, both of which absolute links
+# break. Pure string arithmetic — no path needs to exist yet.
+relative_link_target() {
+    local target="$1" link_path="$2"
+    local link_dir
+    link_dir="$(dirname "$link_path")"
+
+    local -a t d
+    IFS='/' read -ra t <<< "$target"
+    IFS='/' read -ra d <<< "$link_dir"
+
+    local i=0 common=0
+    local tl="${#t[@]}" dl="${#d[@]}"
+    while (( i < tl && i < dl )); do
+        [[ "${t[$i]}" == "${d[$i]}" ]] || break
+        common=$((i + 1))
+        ((i++))
+    done
+
+    local rel=""
+    local j
+    for ((j = common; j < dl; j++)); do
+        rel+="../"
+    done
+    for ((j = common; j < tl; j++)); do
+        rel+="${t[$j]}"
+        ((j < tl - 1)) && rel+="/"
+    done
+    printf '%s' "$rel"
+}
+
+# Hashes a single real file or real directory tree, writing
+# "<sha256>\t<scoped_prefix>[/<relative>]" lines into output_file.
+# real_path may itself be a symlink to a directory — find -L follows it
+# correctly even as the starting path (verified empirically).
+# A broken symlink (neither -f nor -d resolvable) is NOT silently skipped:
+# it gets a sentinel hash derived from its recorded link target, so a
+# symlink appearing, disappearing, or changing target is still visible to
+# the before/after diff instead of vanishing from snapshots entirely.
+_hash_tree_into() {
+    local real_path="$1" scoped_prefix="$2" output_file="$3"
+    if [[ -f "$real_path" ]]; then
+        local h
+        h="$(sha256sum "$real_path" 2>/dev/null)"
+        h="${h:0:64}"
+        [[ -n "$h" ]] && printf '%s\t%s\n' "$h" "$scoped_prefix" >> "$output_file"
+    elif [[ -d "$real_path" ]]; then
+        local filepath rel h
+        while IFS= read -r -d '' filepath; do
+            rel="${filepath#"$real_path"/}"
+            h="$(sha256sum "$filepath" 2>/dev/null)"
+            h="${h:0:64}"
+            [[ -n "$h" ]] && printf '%s\t%s/%s\n' "$h" "$scoped_prefix" "$rel" >> "$output_file"
+        done < <(find -L "$real_path" -path "*/.git" -prune -o -type f -print0 2>/dev/null)
+    elif [[ -L "$real_path" ]]; then
+        local link_target h
+        link_target="$(readlink "$real_path" 2>/dev/null)"
+        h="$(printf 'BROKEN_SYMLINK:%s' "$link_target" | sha256sum)"
+        h="${h:0:64}"
+        printf '%s\t%s\n' "$h" "$scoped_prefix" >> "$output_file"
+    fi
+}
+
+# Full snapshot of everything hypr-switch is allowed to watch: every top-level
+# entry currently in ~/.config, plus every currently-existing WATCHED_HOME_ITEMS
+# entry (filtered through the denylist as a backstop).
+#
+# Units that are still managed links during a capture are shared units left
+# in place by capture-start: writes through them already land in their
+# owner's storage, so they are not hashed (that also keeps multi-GB browser
+# profiles out of every capture).
+compute_snapshot() {
+    local output_file="$1"
+    : > "$output_file"
+
+    if [[ -d "$CONFIG_DIR" ]]; then
+        local entry item_name
+        for entry in "$CONFIG_DIR"/*; do
+            [[ -e "$entry" || -L "$entry" ]] || continue
+            is_managed_link "$entry" && continue
+            item_name="$(basename "$entry")"
+            _hash_tree_into "$entry" "config/$item_name" "$output_file"
+        done
+    fi
+
+    local item real
+    for item in "${WATCHED_HOME_ITEMS[@]}"; do
+        real="$HOME/$item"
+        [[ -e "$real" || -L "$real" ]] || continue
+        is_denied_home_item "$item" && continue
+        is_managed_link "$real" && continue
+        _hash_tree_into "$real" "home/$item" "$output_file"
+    done
+
+    for item in "${WATCHED_LOCAL_ITEMS[@]}"; do
+        real="$LOCAL_SHARE_DIR/$item"
+        [[ -e "$real" || -L "$real" ]] || continue
+        is_managed_link "$real" && continue
+        _hash_tree_into "$real" "local/$item" "$output_file"
+    done
+}
+
+# capture-start only turns interface units (and units private to a non-default
+# ricing) into writable copies. Shared units stay linked to 'default', so an
+# installer that touches them writes straight into default — where shared
+# changes belong anyway — and running apps keep writing to their real data.
+capture_should_desymlink() {
+    local unit="$1" resolved="$2"
+    is_switchable_unit "$unit" && return 0
+    # Dotfiles are small and the user's own: work on a copy so an installer
+    # appending to ~/.bashrc can be kept aside instead of landing in it.
+    [[ "${unit%%/*}" == "home" ]] && return 0
+    case "$resolved" in
+        "$SHELLS_DIR/default/"*) return 1 ;;
+        "$SHELLS_DIR/"*) return 0 ;;
+    esac
+    return 1
+}
+
+# Installers often keep a copy of what they replace (hypr.bak-<date>,
+# kitty.backup, waybar.old…). For a de-symlinked unit that copy is just the
+# snapshot hypr-switch already stores, so it must not become a new unit.
+is_installer_backup_name() {
+    local lower="${1,,}"
+    case "$lower" in
+        *.bak|*.bak[-._]*|*.bak[0-9]*|*-bak|*-bak-*|*_bak|*_bak_*|*.backup|*.backup[-._]*|*-backup|*-backup-*|*_backup*|*.old|*.old[-._]*|*-old|*.orig|*.save|*.pre-*)
+            return 0 ;;
+    esac
+    return 1
+}
+
+# List the claim-unit names (e.g. "config/kitty", "home/.zshrc") a given shell
+# currently owns, one per line.
+list_shell_items() {
+    local shell_name="$1"
+    local base="$SHELLS_DIR/$shell_name/configs"
+    [[ -d "$base" ]] || return 0
+    local scope entry
+    for scope in config home local; do
+        [[ -d "$base/$scope" ]] || continue
+        for entry in "$base/$scope"/*; do
+            [[ -e "$entry" || -L "$entry" ]] || continue
+            printf '%s/%s\n' "$scope" "$(basename "$entry")"
+        done
+    done
+}
+
+discover_shells() {
+    declare -gA VALID_SHELLS=()
+    [[ -d "$SHELLS_DIR" ]] || return 0
+    local dir shell_name count
+    for dir in "$SHELLS_DIR"/*/; do
+        [[ -d "$dir" ]] || continue
+        shell_name="$(basename "$dir")"
+        count="$(list_shell_items "$shell_name" | wc -l)"
+        [[ "$count" -gt 0 ]] && VALID_SHELLS["$shell_name"]="$count"
+    done
+}
+
+# Removes any .git directories found within a path after it's been moved
+# into storage. The .git exclusion in _hash_tree_into only affects what's
+# HASHED (for diffing purposes) — a whole-folder mv still physically carries
+# .git along for the ride unless explicitly stripped afterward. Repo
+# metadata/history has no business being duplicated into every shell that
+# happens to claim a folder some installer git-cloned into.
+_strip_git_dirs() {
+    local base_path="$1"
+    [[ -d "$base_path" ]] || return 0
+    local gitdir
+    while IFS= read -r -d '' gitdir; do
+        rm -rf "$gitdir"
+    done < <(find "$base_path" -name ".git" -type d -print0 2>/dev/null)
+}
+
+# ---------------------------------------------------------------------------
+# Idempotent: safe to call repeatedly, no-ops if default already exists.
+# ---------------------------------------------------------------------------
+bootstrap_default() {
+    local default_configs="$SHELLS_DIR/default/configs"
+    local existing_count
+    existing_count="$(list_shell_items "default" | wc -l)"
+    if [[ "$existing_count" -gt 0 ]]; then
+        echo "'default' already bootstrapped ($existing_count item(s)) — skipping."
+        return 0
+    fi
+
+    mkdir -p "$default_configs/config" "$default_configs/home" "$default_configs/local" "$CANCELLED_HOLDING_DIR"
+    local captured=0
+
+    if [[ -d "$CONFIG_DIR" ]]; then
+        local entry item_name dest
+        for entry in "$CONFIG_DIR"/*; do
+            [[ -e "$entry" || -L "$entry" ]] || continue
+            item_name="$(basename "$entry")"
+            if [[ -L "$entry" ]]; then
+                local resolved
+                resolved="$(readlink -f "$entry")"
+                if [[ ! -e "$resolved" ]]; then
+                    echo "  WARNING: config/$item_name is a broken symlink -> $(readlink "$entry"). Leaving untouched, not managed by hypr-switch." >&2
+                    continue
+                fi
+                case "$resolved" in
+                    "$STORAGE_ROOT"/*) continue ;;
+                esac
+                echo "  NOTE: config/$item_name is a user symlink -> $(readlink "$entry") — capturing dereferenced content rather than the link itself." >&2
+                if ! rm "$entry"; then
+                    echo "  ERROR: failed to remove symlink $entry" >&2
+                    continue
+                fi
+                if ! cp -a "$resolved" "$entry"; then
+                    echo "  ERROR: failed to dereference-copy $entry" >&2
+                    continue
+                fi
+            fi
+            dest="$default_configs/config/$item_name"
+            if [[ -e "$dest" ]]; then
+                echo "  WARNING: $dest already exists — skipping $entry." >&2
+                continue
+            fi
+            if ! mv "$entry" "$dest"; then
+                echo "  ERROR: failed to move $entry" >&2
+                continue
+            fi
+            if [[ -e "$entry" || -L "$entry" ]]; then
+                echo "  ERROR: $entry still present after move — not symlinking." >&2
+                continue
+            fi
+            if ! ln -s "$(relative_link_target "$dest" "$entry")" "$entry"; then
+                echo "  ERROR: failed to symlink $entry" >&2
+                continue
+            fi
+            _strip_git_dirs "$dest"
+            captured=$((captured + 1))
+            echo "  captured: config/$item_name"
+        done
+    fi
+
+    local item real dest
+    for item in "${WATCHED_HOME_ITEMS[@]}"; do
+        real="$HOME/$item"
+        [[ -e "$real" || -L "$real" ]] || continue
+        is_denied_home_item "$item" && continue
+        if [[ -L "$real" ]]; then
+            local resolved
+            resolved="$(readlink -f "$real")"
+            if [[ ! -e "$resolved" ]]; then
+                echo "  WARNING: home/$item is a broken symlink -> $(readlink "$real"). Leaving untouched, not managed by hypr-switch." >&2
+                continue
+            fi
+            case "$resolved" in
+                "$STORAGE_ROOT"/*) continue ;;
+            esac
+            echo "  NOTE: home/$item is a user symlink -> $(readlink "$real") — capturing dereferenced content rather than the link itself." >&2
+            if ! rm "$real"; then
+                echo "  ERROR: failed to remove symlink $real" >&2
+                continue
+            fi
+            if ! cp -a "$resolved" "$real"; then
+                echo "  ERROR: failed to dereference-copy $real" >&2
+                continue
+            fi
+        fi
+        dest="$default_configs/home/$item"
+        if [[ -e "$dest" ]]; then
+            echo "  WARNING: $dest already exists — skipping $real." >&2
+            continue
+        fi
+        mkdir -p "$(dirname "$dest")"
+        if ! mv "$real" "$dest"; then
+            echo "  ERROR: failed to move $real" >&2
+            continue
+        fi
+        if [[ -e "$real" || -L "$real" ]]; then
+            echo "  ERROR: $real still present after move — not symlinking." >&2
+            continue
+        fi
+        if ! ln -s "$(relative_link_target "$dest" "$real")" "$real"; then
+            echo "  ERROR: failed to symlink $real" >&2
+            continue
+        fi
+        _strip_git_dirs "$dest"
+        captured=$((captured + 1))
+        echo "  captured: home/$item"
+    done
+
+    for item in "${WATCHED_LOCAL_ITEMS[@]}"; do
+        real="$LOCAL_SHARE_DIR/$item"
+        [[ -e "$real" || -L "$real" ]] || continue
+        if [[ -L "$real" ]]; then
+            local resolved
+            resolved="$(readlink -f "$real")"
+            if [[ ! -e "$resolved" ]]; then
+                echo "  WARNING: local/$item is a broken symlink -> $(readlink "$real"). Leaving untouched, not managed by hypr-switch." >&2
+                continue
+            fi
+            case "$resolved" in
+                "$STORAGE_ROOT"/*) continue ;;
+            esac
+            echo "  NOTE: local/$item is a user symlink -> $(readlink "$real") — capturing dereferenced content rather than the link itself." >&2
+            if ! rm "$real"; then
+                echo "  ERROR: failed to remove symlink $real" >&2
+                continue
+            fi
+            if ! cp -a "$resolved" "$real"; then
+                echo "  ERROR: failed to dereference-copy $real" >&2
+                continue
+            fi
+        fi
+        dest="$default_configs/local/$item"
+        if [[ -e "$dest" ]]; then
+            echo "  WARNING: $dest already exists — skipping $real." >&2
+            continue
+        fi
+        mkdir -p "$(dirname "$dest")"
+        if ! mv "$real" "$dest"; then
+            echo "  ERROR: failed to move $real" >&2
+            continue
+        fi
+        if [[ -e "$real" || -L "$real" ]]; then
+            echo "  ERROR: $real still present after move — not symlinking." >&2
+            continue
+        fi
+        if ! ln -s "$(relative_link_target "$dest" "$real")" "$real"; then
+            echo "  ERROR: failed to symlink $real" >&2
+            continue
+        fi
+        _strip_git_dirs "$dest"
+        captured=$((captured + 1))
+        echo "  captured: local/$item"
+    done
+
+    echo "default" > "$CURRENT_SHELL_FILE"
+    echo "Bootstrap complete: $captured item(s) captured into 'default'."
+}
+
+# ---------------------------------------------------------------------------
+# capture-start <name>
+# ---------------------------------------------------------------------------
+cmd_capture_start() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        echo "Usage: ricing switch capture-start <shell-name>" >&2
+        exit 1
+    fi
+    if [[ "$name" == "default" ]]; then
+        echo "ERROR: 'default' is captured automatically at install time and cannot be re-captured." >&2
+        exit 1
+    fi
+    if [[ -d "$CAPTURE_STATE_DIR" ]]; then
+        local in_progress
+        in_progress="$(cat "$CAPTURE_STATE_DIR/shell_name" 2>/dev/null || echo "unknown")"
+        echo "ERROR: a capture is already in progress for '$in_progress'." >&2
+        echo "Run 'ricing switch capture-finish $in_progress' or 'ricing switch capture-cancel' first." >&2
+        exit 1
+    fi
+    if [[ "$(list_shell_items "default" | wc -l)" -eq 0 ]]; then
+        echo "ERROR: 'default' has not been bootstrapped yet. Re-run the installer, or run: ricing switch bootstrap" >&2
+        exit 1
+    fi
+
+    mkdir -p "$CAPTURE_STATE_DIR"
+    echo "$name" > "$CAPTURE_STATE_DIR/shell_name"
+    : > "$CAPTURE_STATE_DIR/restore_manifest"
+
+    echo "Preparing to capture '$name'..."
+
+    # Interface items that exist as plain directories (created by an app
+    # after bootstrap, e.g. gtk-4.0 or kdeglobals) are adopted into 'default'
+    # first. Otherwise an installer that rewrites them would move the user's
+    # only copy into the new ricing, and it would vanish on the way back.
+    if [[ -d "$CONFIG_DIR" ]]; then
+        local adopt_entry adopt_name adopt_dest
+        for adopt_entry in "$CONFIG_DIR"/*; do
+            [[ -e "$adopt_entry" && ! -L "$adopt_entry" ]] || continue
+            adopt_name="$(basename "$adopt_entry")"
+            is_switchable_unit "config/$adopt_name" || continue
+            adopt_dest="$SHELLS_DIR/default/configs/config/$adopt_name"
+            [[ -e "$adopt_dest" || -L "$adopt_dest" ]] && continue
+            mkdir -p "$(dirname "$adopt_dest")"
+            if mv "$adopt_entry" "$adopt_dest" \
+                && ln -s "$(relative_link_target "$adopt_dest" "$adopt_entry")" "$adopt_entry"; then
+                echo "  adopted into 'default': config/$adopt_name"
+            fi
+        done
+    fi
+
+    echo "De-symlinking currently managed items into real, writable copies..."
+    local desymlinked=0
+
+    if [[ -d "$CONFIG_DIR" ]]; then
+        local entry item_name
+        for entry in "$CONFIG_DIR"/*; do
+            [[ -e "$entry" || -L "$entry" ]] || continue
+            item_name="$(basename "$entry")"
+            if [[ -L "$entry" ]]; then
+                local resolved
+                resolved="$(readlink -f "$entry")"
+                if [[ ! -e "$resolved" ]]; then
+                    echo "  WARNING: config/$item_name is a broken symlink -> $resolved. Leaving as-is." >&2
+                    continue
+                fi
+                case "$resolved" in
+                    "$STORAGE_ROOT"/*) ;;
+                    *)
+                        echo "  WARNING: config/$item_name is a symlink to $resolved (outside hypr-switch storage) — leaving as-is, not managed by hypr-switch." >&2
+                        continue
+                        ;;
+                esac
+                capture_should_desymlink "config/$item_name" "$resolved" || continue
+                printf '%s\t%s\n' "config/$item_name" "$resolved" >> "$CAPTURE_STATE_DIR/restore_manifest"
+                if ! rm -rf "$entry"; then
+                    echo "  ERROR: failed to remove symlink $entry" >&2
+                    continue
+                fi
+                if ! cp -a "$resolved" "$entry"; then
+                    echo "  ERROR: failed to copy $resolved to $entry" >&2
+                    continue
+                fi
+                desymlinked=$((desymlinked + 1))
+            else
+                echo "  NOTE: config/$item_name is not a symlink (unexpected) — leaving as-is; changes to it won't be captured." >&2
+            fi
+        done
+    fi
+
+    local item real
+    for item in "${WATCHED_HOME_ITEMS[@]}"; do
+        real="$HOME/$item"
+        [[ -e "$real" || -L "$real" ]] || continue
+        is_denied_home_item "$item" && continue
+        if [[ -L "$real" ]]; then
+            local resolved
+            resolved="$(readlink -f "$real")"
+            if [[ ! -e "$resolved" ]]; then
+                echo "  WARNING: home/$item is a broken symlink -> $resolved. Leaving as-is." >&2
+                continue
+            fi
+            case "$resolved" in
+                "$STORAGE_ROOT"/*) ;;
+                *)
+                    echo "  WARNING: home/$item is a symlink to $resolved (outside hypr-switch storage) — leaving as-is, not managed by hypr-switch." >&2
+                    continue
+                    ;;
+            esac
+            capture_should_desymlink "home/$item" "$resolved" || continue
+            printf '%s\t%s\n' "home/$item" "$resolved" >> "$CAPTURE_STATE_DIR/restore_manifest"
+            if ! rm -rf "$real"; then
+                echo "  ERROR: failed to remove symlink $real" >&2
+                continue
+            fi
+            if ! cp -a "$resolved" "$real"; then
+                echo "  ERROR: failed to copy $resolved to $real" >&2
+                continue
+            fi
+            desymlinked=$((desymlinked + 1))
+        else
+            echo "  NOTE: home/$item is not a symlink (unexpected) — leaving as-is; changes to it won't be captured." >&2
+        fi
+    done
+
+    for item in "${WATCHED_LOCAL_ITEMS[@]}"; do
+        real="$LOCAL_SHARE_DIR/$item"
+        [[ -e "$real" || -L "$real" ]] || continue
+        if [[ -L "$real" ]]; then
+            local resolved
+            resolved="$(readlink -f "$real")"
+            if [[ ! -e "$resolved" ]]; then
+                echo "  WARNING: local/$item is a broken symlink -> $resolved. Leaving as-is." >&2
+                continue
+            fi
+            case "$resolved" in
+                "$STORAGE_ROOT"/*) ;;
+                *)
+                    echo "  WARNING: local/$item is a symlink to $resolved (outside hypr-switch storage) — leaving as-is, not managed by hypr-switch." >&2
+                    continue
+                    ;;
+            esac
+            capture_should_desymlink "local/$item" "$resolved" || continue
+            printf '%s\t%s\n' "local/$item" "$resolved" >> "$CAPTURE_STATE_DIR/restore_manifest"
+            if ! rm -rf "$real"; then
+                echo "  ERROR: failed to remove symlink $real" >&2
+                continue
+            fi
+            if ! cp -a "$resolved" "$real"; then
+                echo "  ERROR: failed to copy $resolved to $real" >&2
+                continue
+            fi
+            desymlinked=$((desymlinked + 1))
+        else
+            echo "  NOTE: local/$item is not a symlink (unexpected) — leaving as-is; changes to it won't be captured." >&2
+        fi
+    done
+
+    echo "De-symlinked $desymlinked item(s)."
+    compute_snapshot "$CAPTURE_STATE_DIR/before.snapshot"
+
+    echo ""
+    echo "Ready. Now run '$name''s actual installer normally, exactly as its own instructions say."
+    echo "When it finishes, run:   ricing switch capture-finish $name"
+    echo "If anything goes wrong:  ricing switch capture-cancel"
+}
+
+# ---------------------------------------------------------------------------
+# capture-finish <name>
+# ---------------------------------------------------------------------------
+cmd_capture_finish() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        echo "Usage: ricing switch capture-finish <shell-name>" >&2
+        exit 1
+    fi
+    if [[ ! -d "$CAPTURE_STATE_DIR" ]]; then
+        echo "ERROR: no capture is currently in progress." >&2
+        exit 1
+    fi
+    local in_progress
+    in_progress="$(cat "$CAPTURE_STATE_DIR/shell_name" 2>/dev/null || echo "")"
+    if [[ "$in_progress" != "$name" ]]; then
+        echo "ERROR: a capture is in progress for '$in_progress', not '$name'." >&2
+        exit 1
+    fi
+
+    echo "Finishing capture for '$name'..."
+    compute_snapshot "$CAPTURE_STATE_DIR/after.snapshot"
+
+    declare -A BEFORE_HASH=()
+    declare -A AFTER_HASH=()
+    local hash path
+    while IFS=$'\t' read -r hash path; do
+        [[ -n "$path" ]] && BEFORE_HASH["$path"]="$hash"
+    done < "$CAPTURE_STATE_DIR/before.snapshot"
+    while IFS=$'\t' read -r hash path; do
+        [[ -n "$path" ]] && AFTER_HASH["$path"]="$hash"
+    done < "$CAPTURE_STATE_DIR/after.snapshot"
+
+    declare -A CLAIMED=()
+    local p
+    for p in "${!AFTER_HASH[@]}"; do
+        if [[ "${BEFORE_HASH[$p]:-__missing__}" != "${AFTER_HASH[$p]}" ]]; then
+            CLAIMED["$(claim_unit_of "$p")"]=1
+        fi
+    done
+    for p in "${!BEFORE_HASH[@]}"; do
+        if [[ -z "${AFTER_HASH[$p]+x}" ]]; then
+            CLAIMED["$(claim_unit_of "$p")"]=1
+        fi
+    done
+
+    # Independent re-verification pass: for every de-symlinked unit NOT
+    # already claimed by the diff above, re-hash its LIVE content directly
+    # from disk right now (not the in-memory arrays already used above) and
+    # compare against BEFORE_HASH for that unit's paths. This is a genuinely
+    # separate check, not a re-run of the same comparison — it exists so a
+    # bug in the diff logic above can't silently discard a real change.
+    # Anything that disagrees gets claimed defensively. Comparison is done
+    # via bash associative arrays, not grep/regex, to avoid fragile pattern
+    # matching (an earlier version of this used `grep -F ... "$"`, which is
+    # broken: -F treats `$` as a literal character, not an anchor).
+    if [[ -f "$CAPTURE_STATE_DIR/restore_manifest" ]]; then
+        local unit original_target real_path recheck_file
+        while IFS=$'\t' read -r unit original_target; do
+            [[ -n "$unit" ]] || continue
+            [[ -n "${CLAIMED[$unit]:-}" ]] && continue
+            real_path="$(scoped_path_to_real_path "$unit")"
+            [[ -e "$real_path" || -L "$real_path" ]] || continue
+
+            recheck_file="$(mktemp)"
+            _hash_tree_into "$real_path" "$unit" "$recheck_file"
+
+            declare -A RECHECK_HASH=()
+            local rh_hash rh_path
+            while IFS=$'\t' read -r rh_hash rh_path; do
+                [[ -n "$rh_path" ]] && RECHECK_HASH["$rh_path"]="$rh_hash"
+            done < "$recheck_file"
+            rm -f "$recheck_file"
+
+            local really_same=1 rp bp
+            for rp in "${!RECHECK_HASH[@]}"; do
+                if [[ "${BEFORE_HASH[$rp]:-__missing__}" != "${RECHECK_HASH[$rp]}" ]]; then
+                    really_same=0
+                fi
+            done
+            for bp in "${!BEFORE_HASH[@]}"; do
+                if [[ "$bp" == "$unit" || "$bp" == "$unit"/* ]]; then
+                    if [[ -z "${RECHECK_HASH[$bp]+x}" ]]; then
+                        really_same=0
+                    fi
+                fi
+            done
+            unset RECHECK_HASH
+
+            if [[ "$really_same" -eq 0 ]]; then
+                echo "  NOTE: $unit differs on independent re-check — capturing defensively rather than discarding." >&2
+                CLAIMED["$unit"]=1
+            fi
+        done < "$CAPTURE_STATE_DIR/restore_manifest"
+    fi
+
+    local stamp holding
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    holding="$CANCELLED_HOLDING_DIR/${name}-capture-${stamp}"
+
+    # Brand-new units that are only an installer's backup of something it
+    # replaced (hypr.bak-<date>…) are parked in the holding area: the original
+    # is already safe in hypr-switch storage.
+    declare -A BEFORE_UNIT_SEEN=()
+    for p in "${!BEFORE_HASH[@]}"; do
+        BEFORE_UNIT_SEEN["$(claim_unit_of "$p")"]=1
+    done
+    local backup_unit backup_real
+    for backup_unit in "${!CLAIMED[@]}"; do
+        [[ -n "${BEFORE_UNIT_SEEN[$backup_unit]:-}" ]] && continue
+        is_installer_backup_name "${backup_unit#*/}" || continue
+        backup_real="$(scoped_path_to_real_path "$backup_unit")"
+        unset "CLAIMED[$backup_unit]"
+        [[ -e "$backup_real" || -L "$backup_real" ]] || continue
+        mkdir -p "$(dirname "$holding/$backup_unit")"
+        if mv "$backup_real" "$holding/$backup_unit" 2>/dev/null; then
+            echo "  parked installer backup: $backup_unit -> $holding/$backup_unit"
+        fi
+    done
+
+    # Changes to shared units (app configs, dotfiles, theme/icon dirs that are
+    # not switchable) belong to the default shell, not to the ricing being
+    # captured. Otherwise the next switch would relink them back to default
+    # and silently hide what the installer wrote. Units private to the new
+    # ricing (config/<x> that default does not own) stay with the ricing.
+    # Dotfiles in $HOME are the user's own: a ricing's replacement .zshrc is
+    # kept aside in shells/<name>/extras/ instead of overwriting them.
+    declare -A SHARED_UPDATES=()
+    if [[ "$name" != "default" ]]; then
+        local shared_unit shared_path
+        for shared_unit in "${!CLAIMED[@]}"; do
+            is_switchable_unit "$shared_unit" && continue
+            if [[ "${shared_unit%%/*}" == "home" ]]; then
+                shared_path="$(scoped_path_to_real_path "$shared_unit")"
+                unset "CLAIMED[$shared_unit]"
+                if [[ -e "$shared_path" && ! -L "$shared_path" ]] && shell_owns_unit "default" "$shared_unit"; then
+                    mkdir -p "$(dirname "$SHELLS_DIR/$name/extras/$shared_unit")"
+                    rm -rf "$SHELLS_DIR/$name/extras/$shared_unit"
+                    mv "$shared_path" "$SHELLS_DIR/$name/extras/$shared_unit" \
+                        && echo "  kept your $shared_unit; the ricing's version is in shells/$name/extras/$shared_unit"
+                elif [[ -e "$shared_path" || -L "$shared_path" ]]; then
+                    SHARED_UPDATES["$shared_unit"]=1
+                fi
+                continue
+            fi
+            if [[ "${shared_unit%%/*}" == "config" ]] && ! shell_owns_unit "default" "$shared_unit" \
+                && [[ "${shared_unit#config/}" == "$name" || "${shared_unit#config/}" == "${name,,}" ]]; then
+                continue
+            fi
+            SHARED_UPDATES["$shared_unit"]=1
+            unset "CLAIMED[$shared_unit]"
+        done
+    fi
+
+    if [[ ${#CLAIMED[@]} -eq 0 && ${#SHARED_UPDATES[@]} -eq 0 ]]; then
+        echo "No changes detected — nothing captured for '$name'."
+    else
+        local unit
+        if [[ ${#CLAIMED[@]} -gt 0 ]]; then
+            echo "Claimed for '$name':"
+            for unit in "${!CLAIMED[@]}"; do
+                echo "  - $unit"
+            done
+            echo ""
+        fi
+        if [[ ${#SHARED_UPDATES[@]} -gt 0 ]]; then
+            echo "Updated in 'default' (shared, stays across ricings):"
+            for unit in "${!SHARED_UPDATES[@]}"; do
+                echo "  - $unit"
+            done
+            echo ""
+        fi
+    fi
+
+    local target_dir="$SHELLS_DIR/$name/configs"
+    if [[ ${#CLAIMED[@]} -gt 0 ]]; then
+        mkdir -p "$target_dir/config" "$target_dir/home" "$target_dir/local"
+    fi
+
+    local unit real_path dest_path
+    for unit in "${!CLAIMED[@]}"; do
+        real_path="$(scoped_path_to_real_path "$unit")"
+        dest_path="$target_dir/$unit"
+        if [[ ! -e "$real_path" ]]; then
+            echo "  WARNING: $unit (resolved: $real_path) no longer exists — skipping." >&2
+            continue
+        fi
+        if [[ -e "$dest_path" ]]; then
+            echo "  WARNING: $dest_path already exists — skipping $unit to avoid overwrite." >&2
+            continue
+        fi
+        mkdir -p "$(dirname "$dest_path")"
+        if ! mv "$real_path" "$dest_path"; then
+            echo "  ERROR: mv failed for $unit" >&2
+            continue
+        fi
+        if [[ -e "$real_path" ]]; then
+            echo "  ERROR: $real_path still exists post-move — refusing to symlink over it." >&2
+            continue
+        fi
+        if ! ln -s "$(relative_link_target "$dest_path" "$real_path")" "$real_path"; then
+            echo "  ERROR: ln failed for $unit" >&2
+            continue
+        fi
+        _strip_git_dirs "$dest_path"
+        if [[ "$(readlink -f "$real_path")" == "$(readlink -f "$dest_path")" ]]; then
+            echo "  captured: $unit"
+        else
+            echo "  ERROR: symlink verification failed for $unit" >&2
+        fi
+    done
+
+    # Shared changes live in the default shell: replace its stored copy with
+    # the post-install content and relink, so they remain visible whichever
+    # ricing is active.
+    local shared_real shared_dest
+    for unit in "${!SHARED_UPDATES[@]}"; do
+        shared_real="$(scoped_path_to_real_path "$unit")"
+        shared_dest="$SHELLS_DIR/default/configs/$unit"
+        if [[ ! -e "$shared_real" && ! -L "$shared_real" ]]; then
+            echo "  WARNING: shared $unit was removed — leaving 'default' copy unchanged." >&2
+            continue
+        fi
+        if [[ -L "$shared_real" ]] && is_managed_link "$shared_real"; then
+            # Still the managed link (written in place): nothing to move.
+            continue
+        fi
+        mkdir -p "$(dirname "$shared_dest")"
+        if [[ -e "$shared_dest" || -L "$shared_dest" ]]; then
+            mkdir -p "$(dirname "$holding/default-previous/$unit")"
+            mv "$shared_dest" "$holding/default-previous/$unit" 2>/dev/null || rm -rf "$shared_dest"
+        fi
+        if ! mv "$shared_real" "$shared_dest"; then
+            echo "  ERROR: mv failed for shared $unit" >&2
+            continue
+        fi
+        if ! ln -s "$(relative_link_target "$shared_dest" "$shared_real")" "$shared_real"; then
+            echo "  ERROR: ln failed for shared $unit" >&2
+            continue
+        fi
+        _strip_git_dirs "$shared_dest"
+        if [[ "$(readlink -f "$shared_real")" == "$(readlink -f "$shared_dest")" ]]; then
+            echo "  updated default: $unit"
+        else
+            echo "  ERROR: symlink verification failed for shared $unit" >&2
+        fi
+    done
+
+    if [[ -f "$CAPTURE_STATE_DIR/restore_manifest" ]]; then
+        local unit original_target real_path
+        while IFS=$'\t' read -r unit original_target; do
+            [[ -n "$unit" ]] || continue
+            [[ -n "${CLAIMED[$unit]:-}" ]] && continue
+            [[ -n "${SHARED_UPDATES[$unit]:-}" ]] && continue
+            real_path="$(scoped_path_to_real_path "$unit")"
+            rm -rf "$real_path"
+            if ! ln -s "$(relative_link_target "$original_target" "$real_path")" "$real_path"; then
+                echo "  ERROR: failed to restore symlink for $unit" >&2
+            fi
+        done < "$CAPTURE_STATE_DIR/restore_manifest"
+    fi
+
+    rm -rf "$CAPTURE_STATE_DIR"
+    restore_shared_links
+    if ! find "$holding" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+        rm -rf "$holding"
+    fi
+    echo ""
+    echo "Capture finished for '$name'. ${#CLAIMED[@]} item(s) captured."
+    if [[ ${#SHARED_UPDATES[@]} -gt 0 ]]; then
+        echo "${#SHARED_UPDATES[@]} shared item(s) merged into 'default'."
+    fi
+    if [[ ${#CLAIMED[@]} -gt 0 ]]; then
+        echo ""
+        echo "Note: the captured item(s) are live right now so you can inspect them,"
+        echo "but 'ricing switch --list' / .current_shell still shows your previous shell"
+        echo "until you formally switch. Run 'ricing switch $name' to commit to it (live,"
+        echo "keeping open windows), or 'ricing switch default' to go back to default."
+        if [[ ${#SHARED_UPDATES[@]} -gt 0 ]]; then
+            echo "Shared updates are already part of 'default' and stay in every ricing."
+        fi
+    fi
+}
+
+# After an installer ran, put back any shared link it moved away (an
+# installer doing `mv ~/.config/foo ~/.config/foo.bak` moves the link
+# itself) and drop managed links left under another name. Interface links
+# are left alone: capture-finish deliberately points them at the new ricing.
+restore_shared_links() {
+    local unit real_path source entry scope_dir resolved
+    while IFS= read -r unit; do
+        [[ -n "$unit" ]] || continue
+        is_switchable_unit "$unit" && continue
+        real_path="$(scoped_path_to_real_path "$unit")"
+        [[ -e "$real_path" || -L "$real_path" ]] && continue
+        source="$SHELLS_DIR/default/configs/$unit"
+        mkdir -p "$(dirname "$real_path")"
+        ln -s "$(relative_link_target "$source" "$real_path")" "$real_path" \
+            && echo "  relinked shared $unit"
+    done < <(list_shell_items "default")
+
+    for scope_dir in "$CONFIG_DIR" "$HOME" "$LOCAL_SHARE_DIR"; do
+        [[ -d "$scope_dir" ]] || continue
+        for entry in "$scope_dir"/*; do
+            [[ -L "$entry" ]] || continue
+            if [[ "$scope_dir" == "$HOME" ]]; then
+                case "$(basename "$entry")" in
+                    .config|.local|.hypr-switch) continue ;;
+                esac
+            fi
+            is_managed_link "$entry" || continue
+            resolved="$(readlink "$entry")"
+            [[ "$(basename "$entry")" == "$(basename "$resolved")" ]] && continue
+            rm -f "$entry" && echo "  removed stray link: $entry"
+        done
+    done
+}
+
+# ---------------------------------------------------------------------------
+# capture-cancel
+# ---------------------------------------------------------------------------
+cmd_capture_cancel() {
+    if [[ ! -d "$CAPTURE_STATE_DIR" ]]; then
+        echo "No capture is currently in progress." >&2
+        exit 1
+    fi
+    local in_progress
+    in_progress="$(cat "$CAPTURE_STATE_DIR/shell_name" 2>/dev/null || echo "unknown")"
+    echo "Cancelling capture for '$in_progress'..."
+
+    local stamp holding
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    holding="$CANCELLED_HOLDING_DIR/${in_progress}-${stamp}"
+    # Deliberately NOT pre-creating $holding/config and $holding/home here —
+    # each actual relocation site below creates its own parent directory
+    # lazily via mkdir -p right before its mv. Pre-creating them here would
+    # leave two permanently-empty subdirectories even when nothing is ever
+    # relocated, defeating the empty-holding-dir cleanup at the end of this
+    # function (confirmed directly: this was a real bug caught by testing).
+
+    declare -A RESTORED=()
+
+    # Units that already existed (as real files/dirs) when capture-start ran.
+    # Anything here is pre-existing user content that hypr-switch never
+    # managed — capture-start explicitly left it as-is ("changes to it won't
+    # be captured"), so capture-cancel must leave it in place too, never
+    # relocate it to the holding area.
+    declare -A BEFORE_UNITS=()
+    if [[ -f "$CAPTURE_STATE_DIR/before.snapshot" ]]; then
+        local _bh _bp
+        while IFS=$'\t' read -r _bh _bp; do
+            [[ -n "$_bp" ]] && BEFORE_UNITS["$(claim_unit_of "$_bp")"]=1
+        done < "$CAPTURE_STATE_DIR/before.snapshot"
+    fi
+
+    if [[ -f "$CAPTURE_STATE_DIR/restore_manifest" ]]; then
+        local unit original_target real_path
+        while IFS=$'\t' read -r unit original_target; do
+            [[ -n "$unit" ]] || continue
+            real_path="$(scoped_path_to_real_path "$unit")"
+            RESTORED["$unit"]=1
+            if [[ -e "$real_path" ]]; then
+                # Only preserve this de-symlinked copy if it's genuinely
+                # different from the original it came from — an unmodified
+                # item is just a redundant duplicate of what's already
+                # safely stored at original_target, so it's discarded
+                # directly rather than cluttering the holding area with an
+                # identical copy (confirmed via direct testing: without this
+                # check, EVERY cancel relocated EVERY managed item, even
+                # completely untouched ones, since capture-start de-symlinks
+                # everything unconditionally regardless of what actually
+                # changes).
+                if diff -rq "$real_path" "$original_target" >/dev/null 2>&1; then
+                    rm -rf "$real_path"
+                else
+                    mkdir -p "$(dirname "$holding/$unit")"
+                    mv "$real_path" "$holding/$unit" 2>/dev/null
+                fi
+            fi
+            if ! ln -s "$(relative_link_target "$original_target" "$real_path")" "$real_path"; then
+                echo "  ERROR: failed to restore symlink for $unit" >&2
+            else
+                echo "  restored: $unit"
+            fi
+        done < "$CAPTURE_STATE_DIR/restore_manifest"
+    fi
+
+    if [[ -d "$CONFIG_DIR" ]]; then
+        local entry item_name unit real_path
+        # This loop is only looking for genuinely NEW real content the
+        # installer created (no restore_manifest entry exists for it, since
+        # it didn't exist at capture-start). It deliberately excludes ALL
+        # symlinks via the -L check below, including broken ones — any
+        # symlink here was either already handled by the restore_manifest
+        # loop above, or was never something hypr-switch touched at all.
+        for entry in "$CONFIG_DIR"/*; do
+            [[ -e "$entry" ]] || continue
+            [[ -L "$entry" ]] && continue
+            item_name="$(basename "$entry")"
+            unit="config/$item_name"
+            [[ -n "${RESTORED[$unit]:-}" ]] && continue
+            [[ -n "${BEFORE_UNITS[$unit]:-}" ]] && continue
+            mkdir -p "$holding/config"
+            mv "$entry" "$holding/$unit" 2>/dev/null
+            echo "  relocated new/unclaimed item to holding area: $unit"
+        done
+    fi
+    local item real unit
+    for item in "${WATCHED_HOME_ITEMS[@]}"; do
+        real="$HOME/$item"
+        [[ -e "$real" ]] || continue
+        [[ -L "$real" ]] && continue
+        unit="home/$item"
+        [[ -n "${RESTORED[$unit]:-}" ]] && continue
+        [[ -n "${BEFORE_UNITS[$unit]:-}" ]] && continue
+        is_denied_home_item "$item" && continue
+        mkdir -p "$(dirname "$holding/$unit")"
+        mv "$real" "$holding/$unit" 2>/dev/null
+        echo "  relocated new/unclaimed item to holding area: $unit"
+    done
+
+    for item in "${WATCHED_LOCAL_ITEMS[@]}"; do
+        real="$LOCAL_SHARE_DIR/$item"
+        [[ -e "$real" ]] || continue
+        [[ -L "$real" ]] && continue
+        unit="local/$item"
+        [[ -n "${RESTORED[$unit]:-}" ]] && continue
+        [[ -n "${BEFORE_UNITS[$unit]:-}" ]] && continue
+        mkdir -p "$(dirname "$holding/$unit")"
+        mv "$real" "$holding/$unit" 2>/dev/null
+        echo "  relocated new/unclaimed item to holding area: $unit"
+    done
+
+    rm -rf "$CAPTURE_STATE_DIR"
+    restore_shared_links
+    echo ""
+    echo "Capture cancelled. Original state restored."
+
+    # Only mention/keep the holding area if something was actually relocated
+    # into it — an empty timestamped folder left behind on every cancel would
+    # just be clutter with nothing to recover.
+    if find "$holding" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+        echo "Anything the installer wrote was preserved (not deleted) at:"
+        echo "  $holding"
+    else
+        rm -rf "$holding"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# capture-status
+# ---------------------------------------------------------------------------
+cmd_capture_status() {
+    if [[ ! -d "$CAPTURE_STATE_DIR" ]]; then
+        echo "No capture is currently in progress."
+        return 0
+    fi
+    local in_progress
+    in_progress="$(cat "$CAPTURE_STATE_DIR/shell_name" 2>/dev/null || echo "unknown")"
+    echo "Capture in progress for: $in_progress"
+    if [[ -f "$CAPTURE_STATE_DIR/restore_manifest" ]]; then
+        echo "De-symlinked items (will be restored automatically unless changed):"
+        local unit rest
+        while IFS=$'\t' read -r unit rest; do
+            [[ -n "$unit" ]] && echo "  - $unit"
+        done < "$CAPTURE_STATE_DIR/restore_manifest"
+    fi
+    echo ""
+    echo "Next steps:"
+    echo "  ricing switch capture-finish $in_progress    (after running the installer)"
+    echo "  ricing switch capture-cancel                 (to abort)"
+}
+
+# ---------------------------------------------------------------------------
+# show <name>
+# ---------------------------------------------------------------------------
+cmd_show() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        echo "Usage: ricing switch show <shell-name>" >&2
+        exit 1
+    fi
+    local items
+    items="$(list_shell_items "$name")"
+    if [[ -z "$items" ]]; then
+        echo "'$name' owns no items (does it exist? try: ricing switch --list)" >&2
+        exit 1
+    fi
+    echo "'$name' owns ($(session_type_label "$(shell_session_type "$name")") ricing):"
+    local unit label
+    while IFS= read -r unit; do
+        [[ -n "$unit" ]] || continue
+        if is_ricing_unit "$name" "$unit"; then
+            label="interface"
+        elif [[ "$name" == "default" ]]; then
+            label="shared (default)"
+        else
+            label="shared — stays on default"
+        fi
+        printf '  - %s (%s)\n' "$unit" "$label"
+    done <<< "$items"
+}
+
+# ---------------------------------------------------------------------------
+# Switching model
+#
+# A ricing only owns desktop-interface units (SWITCHABLE_CONFIG_ITEMS plus
+# SWITCHABLE_LOCAL_ITEMS). Every other unit — app configs, browser/chat
+# profiles, systemd units, home/* dotfiles, other local/* resources — always
+# points at the "default" shell. That is what makes a switch change the
+# interface instead of creating a fresh-OS feeling: apps, accounts, files and
+# data stay exactly where they are.
+# ---------------------------------------------------------------------------
+
+# Build DESIRED_UNITS (unit -> owner) for a target ricing.
+build_desired_units() {
+    local target="$1" unit
+    declare -gA DESIRED_UNITS=()
+
+    while IFS= read -r unit; do
+        [[ -n "$unit" ]] || continue
+        if ! is_switchable_unit "$unit"; then
+            DESIRED_UNITS["$unit"]="default"
+        elif [[ "$target" == "default" ]] || ! shell_owns_unit "$target" "$unit"; then
+            DESIRED_UNITS["$unit"]="default"
+        else
+            DESIRED_UNITS["$unit"]="$target"
+        fi
+    done < <(list_shell_items "default")
+
+    if [[ "$target" != "default" ]]; then
+        while IFS= read -r unit; do
+            [[ -n "$unit" ]] || continue
+            is_ricing_unit "$target" "$unit" || continue
+            DESIRED_UNITS["$unit"]="$target"
+        done < <(list_shell_items "$target")
+    fi
+}
+
+# Validate every desired link BEFORE mutating anything. A real file/directory
+# where a managed link belongs is user data (or a half-applied switch); abort
+# rather than delete it, so a failed switch can never eat a config.
+validate_desired_units() {
+    local unit owner desired_source real_path
+    for unit in "${!DESIRED_UNITS[@]}"; do
+        owner="${DESIRED_UNITS[$unit]}"
+        desired_source="$SHELLS_DIR/$owner/configs/$unit"
+        real_path="$(scoped_path_to_real_path "$unit")"
+
+        if [[ ! -e "$desired_source" && ! -L "$desired_source" ]]; then
+            echo "ERROR: '$owner' has no stored data for $unit ($desired_source)." >&2
+            echo "Refusing to continue — hypr-switch storage is incomplete." >&2
+            return 1
+        fi
+        if [[ -L "$real_path" ]] && [[ "$(readlink -f "$real_path")" == "$(readlink -f "$desired_source")" ]]; then
+            continue
+        fi
+        if [[ -e "$real_path" && ! -L "$real_path" ]] && [[ "$owner" != "default" ]] \
+            && ! is_switchable_unit "$unit" && ! shell_owns_unit "default" "$unit"; then
+            # A ricing-private item (config/nebula…) recreated by a program
+            # while that ricing was not active: park it, the ricing's stored
+            # copy is the real one.
+            local parked="$CANCELLED_HOLDING_DIR/stray-$(date +%Y%m%d-%H%M%S)/$unit"
+            mkdir -p "$(dirname "$parked")"
+            if mv "$real_path" "$parked"; then
+                echo "  NOTE: stray $unit moved to $parked" >&2
+                continue
+            fi
+        fi
+        if [[ -e "$real_path" && ! -L "$real_path" ]]; then
+            echo "ERROR: $unit ($real_path) is a real file/directory, not a hypr-switch symlink." >&2
+            echo "Refusing to touch it — aborting before any change to avoid data loss." >&2
+            return 1
+        fi
+    done
+    return 0
+}
+
+# Point every desired unit at its owner, then remove leftover managed links
+# (e.g. interface dirs owned by the previously active ricing). Links that do
+# not point into hypr-switch storage are never touched.
+apply_desired_units() {
+    local unit owner desired_source real_path changed=0
+    declare -A DESIRED_PATHS=()
+
+    for unit in "${!DESIRED_UNITS[@]}"; do
+        owner="${DESIRED_UNITS[$unit]}"
+        desired_source="$SHELLS_DIR/$owner/configs/$unit"
+        real_path="$(scoped_path_to_real_path "$unit")"
+        DESIRED_PATHS["$real_path"]=1
+
+        if [[ -L "$real_path" ]] && [[ "$(readlink -f "$real_path")" == "$(readlink -f "$desired_source")" ]]; then
+            continue
+        fi
+
+        rm -f "$real_path"
+        mkdir -p "$(dirname "$real_path")"
+        if ! ln -s "$(relative_link_target "$desired_source" "$real_path")" "$real_path"; then
+            echo "  ERROR: failed to symlink $unit" >&2
+            return 1
+        fi
+        changed=$((changed + 1))
+    done
+
+    local scope_dir entry
+    for scope_dir in "$CONFIG_DIR" "$HOME" "$LOCAL_SHARE_DIR"; do
+        [[ -d "$scope_dir" ]] || continue
+        for entry in "$scope_dir"/*; do
+            [[ -L "$entry" ]] || continue
+            [[ -n "${DESIRED_PATHS[$entry]:-}" ]] && continue
+            if [[ "$scope_dir" == "$HOME" ]]; then
+                case "$(basename "$entry")" in
+                    .config|.local|.hypr-switch) continue ;;
+                esac
+            fi
+            if is_managed_link "$entry"; then
+                rm -f "$entry"
+                echo "  removed stale link: $entry"
+                changed=$((changed + 1))
+            fi
+        done
+    done
+
+    echo "  $changed link(s) updated."
+    return 0
+}
+
+# Stop every running Quickshell shell (old ricing) and hypridle, which is
+# ricing-specific. Quickshell's clean kill makes omarchy-launch-shell's
+# supervisor exit on its own, exactly like omarchy-restart-shell expects.
+stop_running_shells() {
+    local config_path config_dir stopped=0
+    while IFS= read -r config_path; do
+        [[ -n "$config_path" ]] || continue
+        config_dir="$(dirname "$config_path")"
+        echo "  Stopping shell: $config_path"
+        while timeout 30 quickshell kill -p "$config_dir" --any-display >/dev/null 2>&1; do :; done
+        stopped=$((stopped + 1))
+    done < <(quickshell list -a -j 2>/dev/null | jq -r '.[].config_path // empty' 2>/dev/null)
+
+    pkill -x hypridle 2>/dev/null || true
+
+    # Bars and notification daemons of waybar-style ricings, plus whatever the
+    # active ricing declares with stop= in its ricing.conf. None of them is
+    # part of the Omarchy (default) interface, which is all Quickshell.
+    local current="" proc line
+    [[ -f "$CURRENT_SHELL_FILE" ]] && current="$(cat "$CURRENT_SHELL_FILE" 2>/dev/null || true)"
+    local -a procs=(waybar swaync dunst mako eww ags hyprpanel nwg-panel nwg-dock-hyprland swaybg hyprpaper swww-daemon awww-daemon swayosd-server)
+    if [[ -n "$current" ]]; then
+        while IFS= read -r line; do
+            for proc in $line; do procs+=("$proc"); done
+        done < <(shell_meta_values "$current" stop)
+    fi
+    for proc in "${procs[@]}"; do
+        if pkill -x "$proc" 2>/dev/null; then
+            echo "  Stopped $proc"
+            stopped=$((stopped + 1))
+        fi
+    done
+    (( stopped > 0 )) || echo "  No running shell instance found."
+}
+
+# Run a command inside Hyprland so it inherits the session environment; fall
+# back to a detached process when hyprctl cannot dispatch.
+hypr_exec() {
+    local command="$1"
+    if [[ "$command" == *"]]"* ]] || ! hyprctl dispatch "hl.dsp.exec_cmd([[$command]])" >/dev/null 2>&1; then
+        setsid bash -c "$command" >/dev/null 2>&1 &
+    fi
+}
+
+# Start what a ricing declares in ricing.conf (start=, wallpaper=builtin).
+# Returns 1 when the ricing declares nothing, so start_shell falls back to its
+# Quickshell/bar detection.
+start_declared() {
+    local shell_name="$1" command any=0 missing
+    if [[ "$(shell_meta_value "$shell_name" wallpaper)" == "builtin" ]]; then
+        echo "  Starting hypr-switch wallpaper layer..."
+        hypr_exec "qs -p $STORAGE_ROOT/lib/wallpaper"
+        any=1
+    fi
+    while IFS= read -r command; do
+        [[ -n "$command" ]] || continue
+        echo "  Starting: $command"
+        hypr_exec "$command"
+        any=1
+    done < <(shell_meta_values "$shell_name" start)
+
+    missing="$(shell_missing_packages "$shell_name" | tr '\n' ' ')"
+    if [[ -n "${missing// /}" ]]; then
+        echo "  WARNING: '$shell_name' needs packages that are not installed: $missing" >&2
+        echo "           Install them with: ricing deps $shell_name" >&2
+        notify "$shell_name: missing packages ($missing) — run: ricing deps $shell_name" --urgency=critical
+    fi
+    (( any ))
+}
+
+# Start the auxiliary Quickshell configs a ricing's Hyprland config asks for
+# (notifications, sparks, OSD…). The main shell is started separately; without
+# this, a live switch only starts the launcher and leaves notifications dead.
+start_aux_quickshells() {
+    local shell_name="$1" main_qs="$2"
+    local hypr_dir="$SHELLS_DIR/$shell_name/configs/config/hypr"
+    local qs_dir="$SHELLS_DIR/$shell_name/configs/config/quickshell"
+    [[ -d "$hypr_dir" && -d "$qs_dir" ]] || return 0
+
+    local -a configs=()
+    local c
+    while IFS= read -r c; do
+        [[ -n "$c" ]] || continue
+        [[ "$c" == "$main_qs" ]] && continue
+        [[ -f "$qs_dir/$c/shell.qml" ]] || continue
+        configs+=("$c")
+    done < <(grep -rhoE '\b(qs|quickshell) -c [A-Za-z0-9_.-]+' "$hypr_dir" 2>/dev/null \
+        | awk '{print $NF}' | sort -u)
+
+    for c in "${configs[@]}"; do
+        if command -v quickshell >/dev/null 2>&1 \
+            && quickshell list -a -j 2>/dev/null | jq -r '.[].config_path // empty' 2>/dev/null \
+                | grep -qF "quickshell/$c/shell.qml"; then
+            continue
+        fi
+        echo "  Starting Quickshell config '$c'..."
+        if ! hyprctl dispatch "hl.dsp.exec_cmd(\"qs -c $c\")" >/dev/null 2>&1; then
+            setsid qs -c "$c" >/dev/null 2>&1 &
+        fi
+    done
+}
+
+# Start whichever bar/notification daemon a non-Quickshell ricing ships and
+# that is actually installed. A ricing with neither is still a valid switch:
+# its Hyprland config is already live after the reload, and a bare desktop is
+# better than a failed switch.
+start_bar_fallback() {
+    local shell_name="$1" started=0
+    if shell_owns_unit "$shell_name" "config/waybar" && command -v waybar >/dev/null 2>&1; then
+        echo "  Starting waybar..."
+        if ! hyprctl dispatch "hl.dsp.exec_cmd(\"waybar\")" >/dev/null 2>&1; then
+            setsid waybar >/dev/null 2>&1 &
+        fi
+        started=1
+    fi
+    if shell_owns_unit "$shell_name" "config/swaync" && command -v swaync >/dev/null 2>&1; then
+        echo "  Starting swaync..."
+        if ! hyprctl dispatch "hl.dsp.exec_cmd(\"swaync\")" >/dev/null 2>&1; then
+            setsid swaync >/dev/null 2>&1 &
+        fi
+        started=1
+    fi
+    if shell_owns_unit "$shell_name" "config/dunst" && command -v dunst >/dev/null 2>&1; then
+        echo "  Starting dunst..."
+        if ! hyprctl dispatch "hl.dsp.exec_cmd(\"dunst\")" >/dev/null 2>&1; then
+            setsid dunst >/dev/null 2>&1 &
+        fi
+        started=1
+    fi
+    if shell_uses_hypridle "$shell_name" && command -v hypridle >/dev/null 2>&1; then
+        setsid hypridle >/dev/null 2>&1 &
+        started=1
+    fi
+    if (( started )); then
+        echo "  Bar/notification services started."
+    else
+        echo "  '$shell_name' has no Quickshell config and no installed bar; the Hyprland config is live."
+    fi
+    return 0
+}
+
+# Start a ricing's shell from Hyprland so it inherits the canonical session
+# environment. Omarchy uses its supervised launcher; any other ricing that
+# ships a Quickshell config is started with `qs -c <config>`.
+start_shell() {
+    local shell_name="$1"
+    local qs_config launcher=""
+    qs_config="$(shell_quickconfig_name "$shell_name")"
+
+    if shell_owns_unit "$shell_name" "config/omarchy"; then
+        if command -v omarchy-launch-shell >/dev/null 2>&1; then
+            launcher="$(command -v omarchy-launch-shell)"
+        elif [[ -x /usr/share/omarchy/bin/omarchy-launch-shell ]]; then
+            launcher="/usr/share/omarchy/bin/omarchy-launch-shell"
+        fi
+        if [[ -n "$launcher" ]]; then
+            hyprctl dispatch "hl.dsp.exec_cmd(\"$launcher\")" >/dev/null 2>&1 && return 0
+        fi
+        echo "  WARNING: cannot start the Omarchy shell automatically." >&2
+        return 1
+    fi
+
+    # A ricing.conf with start= entries is authoritative: it lists exactly
+    # what the ricing's own autostart runs at login.
+    if [[ -n "$(shell_meta_values "$shell_name" start)" ]]; then
+        start_declared "$shell_name"
+        return 0
+    fi
+    start_declared "$shell_name" || true
+
+    if [[ -z "$qs_config" ]]; then
+        start_bar_fallback "$shell_name"
+        return 0
+    fi
+
+    echo "  Starting Quickshell config '$qs_config'..."
+    if ! hyprctl dispatch "hl.dsp.exec_cmd(\"qs -c $qs_config\")" >/dev/null 2>&1; then
+        echo "  WARNING: hyprctl dispatch failed; launching qs directly." >&2
+        setsid qs -c "$qs_config" >/dev/null 2>&1 &
+    fi
+
+    start_aux_quickshells "$shell_name" "$qs_config"
+
+    if shell_uses_hypridle "$shell_name" && command -v hypridle >/dev/null 2>&1; then
+        setsid hypridle >/dev/null 2>&1 &
+    fi
+    return 0
+}
+
+# Wait until Quickshell reports an instance for the shell we just started.
+# Ricings that use no Quickshell (waybar/dunst, or a bare Hyprland config) are
+# already applied once the reload succeeded, so there is nothing to wait for.
+wait_for_shell() {
+    local shell_name="$1"
+    local deadline=$((SECONDS + 45))
+    local qs_config pattern
+    if ! shell_owns_unit "$shell_name" "config/omarchy" && [[ -n "$(shell_meta_values "$shell_name" start)" ]]; then
+        # Wait for the Quickshell configs the ricing starts (if any); other
+        # programs (waybar, dunst…) are fire-and-forget, a missing one only
+        # degrades the desktop and must not revert the switch.
+        local -a wanted=()
+        local command
+        while IFS= read -r command; do
+            if [[ "$command" =~ (^|[[:space:]/])(qs|quickshell)[[:space:]].*-c[[:space:]]+([A-Za-z0-9_.-]+) ]]; then
+                wanted+=("quickshell/${BASH_REMATCH[3]}/shell.qml")
+            fi
+        done < <(shell_meta_values "$shell_name" start)
+        command -v quickshell >/dev/null 2>&1 || return 0
+        for pattern in "${wanted[@]}"; do
+            while ! quickshell list -a -j 2>/dev/null | jq -r '.[].config_path // empty' 2>/dev/null | grep -qF "$pattern"; do
+                (( SECONDS < deadline )) || { echo "  ERROR: Quickshell config ${pattern%/shell.qml} did not start." >&2; return 1; }
+                sleep 0.25
+            done
+        done
+        return 0
+    fi
+    qs_config="$(shell_quickconfig_name "$shell_name")"
+    if [[ -z "$qs_config" ]] && ! shell_owns_unit "$shell_name" "config/omarchy"; then
+        return 0
+    fi
+    command -v quickshell >/dev/null 2>&1 || return 1
+    if [[ -n "$qs_config" ]]; then
+        pattern="quickshell/$qs_config/shell.qml"
+    else
+        pattern="/omarchy/shell/shell.qml"
+    fi
+
+    while (( SECONDS < deadline )); do
+        if quickshell list -a -j 2>/dev/null | jq -r '.[].config_path // empty' 2>/dev/null | grep -qF "$pattern"; then
+            return 0
+        fi
+        sleep 0.25
+    done
+    return 1
+}
+
+# Path to a ricing's main Hyprland Lua config, if it has one. The overlay is a
+# Lua file of hl.bind calls, so only a Lua config can load it.
+shell_main_config() {
+    local shell_name="$1" base
+    base="$SHELLS_DIR/$shell_name/configs/config/hypr"
+    if [[ -f "$base/hyprland.lua" ]]; then
+        printf '%s' "$base/hyprland.lua"
+        return 0
+    fi
+    return 1
+}
+
+# Append the overlay loader once, at the end of the ricing's main config so the
+# Omarchy keymap is applied after the ricing's own keybinds.
+patch_keymap_include() {
+    local shell_name="$1" main
+    if ! main="$(shell_main_config "$shell_name")"; then
+        echo "  WARNING: '$shell_name' has no Hyprland Lua config; cannot load the Omarchy keymap overlay." >&2
+        return 1
+    fi
+    grep -qF "$KEYMAP_MARKER" "$main" && return 0
+
+    if [[ -s "$main" ]] && [[ "$(tail -c 1 "$main" | wc -l)" -eq 0 ]]; then
+        printf '\n' >> "$main"
+    fi
+    cat >> "$main" <<'HYPR_SWITCH_KEYMAP_EOF'
+
+-- hypr-switch: Omarchy keymap overlay (generated; do not edit)
+do
+  local overlay = (os.getenv("HOME") or "") .. "/.hypr-switch/keymap/omarchy-keymap.lua"
+  local file = io.open(overlay, "r")
+  if file then
+    file:close()
+    local ok, err = pcall(dofile, overlay)
+    if not ok then
+      print("[hypr-switch] Omarchy keymap overlay failed: " .. tostring(err))
+    end
+  end
+end
+HYPR_SWITCH_KEYMAP_EOF
+}
+
+# Rebuild the shared overlay for a ricing. Failure is reported but never stops
+# a switch: a missing keymap should not leave the user without a desktop.
+ensure_keymap_overlay() {
+    local shell_name="$1"
+    [[ "$shell_name" == "default" ]] && return 0
+    # The overlay is a Lua file of Hyprland binds: only Hyprland ricings load
+    # it. Plasma/other sessions must be left completely alone.
+    [[ "$(shell_session_type "$shell_name")" == "hyprland" ]] || return 0
+
+    if [[ ! -x "$KEYMAP_GENERATOR" ]]; then
+        echo "  WARNING: $KEYMAP_GENERATOR is missing or not executable; Omarchy keymap not applied." >&2
+        return 1
+    fi
+    local status=0
+    if lua -E "$KEYMAP_GENERATOR" "$shell_name"; then
+        patch_keymap_include "$shell_name" || status=1
+    else
+        echo "  WARNING: could not generate the Omarchy keymap for '$shell_name'." >&2
+        status=1
+    fi
+    patch_machine_include "$shell_name" || status=1
+    return $status
+}
+
+# Append the machine overlay (this laptop's monitors and keyboard layout from
+# the default shell) after everything else, so upstream dotfiles that
+# hard-code their author's screens or a US layout still fit this machine.
+MACHINE_MARKER="hypr-switch: machine overlay"
+patch_machine_include() {
+    local shell_name="$1" main
+    main="$(shell_main_config "$shell_name")" || return 1
+    grep -qF "$MACHINE_MARKER" "$main" && return 0
+    if [[ -s "$main" ]] && [[ "$(tail -c 1 "$main" | wc -l)" -eq 0 ]]; then
+        printf '\n' >> "$main"
+    fi
+    cat >> "$main" <<'HYPR_SWITCH_MACHINE_EOF'
+
+-- hypr-switch: machine overlay (monitors + keyboard of this machine; do not edit)
+do
+  local overlay = (os.getenv("HOME") or "") .. "/.hypr-switch/lib/machine.lua"
+  local file = io.open(overlay, "r")
+  if file then
+    file:close()
+    local ok, err = pcall(dofile, overlay)
+    if not ok then
+      print("[hypr-switch] machine overlay failed: " .. tostring(err))
+    end
+  end
+end
+HYPR_SWITCH_MACHINE_EOF
+}
+
+# Path to the wallpaper a ricing declares in config/hypr/wallpaper (relative to
+# its config directory, or absolute), if it declares one.
+shell_wallpaper_path() {
+    local shell_name="$1"
+    local hypr_dir="$SHELLS_DIR/$shell_name/configs/config/hypr"
+    local decl
+    [[ -f "$hypr_dir/wallpaper" ]] || return 1
+    decl="$(head -n1 "$hypr_dir/wallpaper" 2>/dev/null | tr -d '\r')"
+    [[ -n "$decl" ]] || return 1
+    if [[ "$decl" == /* ]]; then
+        printf '%s' "$decl"
+    else
+        printf '%s' "$hypr_dir/$decl"
+    fi
+}
+
+# Set the wallpaper a ricing ships, and put Omarchy's own background back when
+# returning to 'default'. The previous default background is saved the first
+# time a ricing overrides it, so a user-picked wallpaper survives a round trip.
+apply_shell_wallpaper() {
+    local shell_name="$1"
+    local current_bg="$HOME/.local/state/omarchy/current/background"
+    local saved="$STORAGE_ROOT/.default_background"
+    local previous="" target="" wp=""
+
+    [[ -f "$CURRENT_SHELL_FILE" ]] && previous="$(cat "$CURRENT_SHELL_FILE" 2>/dev/null || echo "")"
+    [[ -n "$previous" ]] || previous="default"
+
+    if [[ "$shell_name" == "default" ]]; then
+        # No saved background (first switch happened before the ricing had a
+        # wallpaper, or the state file was cleared): fall back to the active
+        # theme's own background so returning to Omarchy never leaves a
+        # ricing wallpaper behind.
+        if [[ ! -s "$saved" ]]; then
+            local theme_bg=""
+            theme_bg="$(find "$HOME/.local/state/omarchy/current/theme/backgrounds" -maxdepth 1 -type f 2>/dev/null | sort | head -n1)"
+            [[ -n "$theme_bg" ]] && printf '%s\n' "$theme_bg" > "$saved" || true
+        fi
+        if [[ -s "$saved" ]]; then
+            target="$(cat "$saved" 2>/dev/null || true)"
+            rm -f "$saved"
+            if [[ -n "$target" && -f "$target" ]]; then
+                omarchy-theme-bg-set "$target" >/dev/null 2>&1 || true
+                echo "  Restored default background: $target"
+            fi
+        fi
+        return 0
+    fi
+
+    if ! wp="$(shell_wallpaper_path "$shell_name")"; then
+        return 0
+    fi
+    [[ -f "$wp" ]] || { echo "  WARNING: wallpaper not found: $wp" >&2; return 0; }
+
+    if [[ "$previous" == "default" && ! -s "$saved" && -e "$current_bg" ]]; then
+        readlink -f "$current_bg" > "$saved" 2>/dev/null || true
+    fi
+
+    if command -v omarchy-theme-bg-set >/dev/null 2>&1; then
+        omarchy-theme-bg-set "$wp" >/dev/null 2>&1 || true
+        echo "  Wallpaper: $wp"
+    fi
+}
+
+# Hyprland reports Lua/config errors through `hyprctl configerrors` instead of
+# failing the reload. Treat a non-empty report as a failed switch so do_switch
+# can revert to the previous ricing instead of leaving a broken desktop.
+config_has_errors() {
+    local errors
+    errors="$(hyprctl configerrors 2>/dev/null || true)"
+    [[ -n "${errors//[[:space:]]/}" ]]
+}
+
+# Full live apply for one ricing: links, Hyprland reload, shell start.
+apply_shell_live() {
+    local shell_name="$1"
+    build_desired_units "$shell_name" || return 1
+    validate_desired_units || return 1
+    apply_desired_units || return 1
+    apply_shell_wallpaper "$shell_name"
+    ensure_keymap_overlay "$shell_name" || true
+    echo "$shell_name" > "$CURRENT_SHELL_FILE"
+
+    if ! hyprctl reload >/dev/null 2>&1; then
+        echo "  WARNING: hyprctl reload failed; the shell will still be started." >&2
+    fi
+    if config_has_errors; then
+        echo "ERROR: Hyprland reported configuration errors:" >&2
+        hyprctl configerrors 2>/dev/null | sed 's/^/  /' >&2
+        return 1
+    fi
+
+    start_shell "$shell_name" || return 1
+    wait_for_shell "$shell_name" || return 1
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# switch <name> — live by default (keeps open windows); --logout forces the
+# old log-out path, and an automatic revert protects a failed live switch.
+# ---------------------------------------------------------------------------
+do_switch() {
+    local target="$1"
+
+    if [[ -d "$CAPTURE_STATE_DIR" ]]; then
+        echo "ERROR: a capture is currently in progress — finish or cancel it before switching." >&2
+        echo "  ricing switch capture-status" >&2
+        exit 1
+    fi
+
+    discover_shells
+    if [[ -z "${VALID_SHELLS[$target]:-}" ]]; then
+        echo "ERROR: unknown shell '$target'." >&2
+        echo "Known shells: ${!VALID_SHELLS[*]}" >&2
+        exit 1
+    fi
+
+    local current=""
+    [[ -f "$CURRENT_SHELL_FILE" ]] && current="$(cat "$CURRENT_SHELL_FILE" 2>/dev/null || echo "")"
+    [[ -n "$current" ]] || current="default"
+
+    echo "Switching to '$target'..."
+
+    build_desired_units "$target"
+    if ! validate_desired_units; then
+        notify "Switch to $target aborted — see terminal for details" --urgency=critical 2>/dev/null
+        exit 1
+    fi
+
+    local target_type current_type
+    target_type="$(shell_session_type "$target")"
+    current_type="$(current_session_type)"
+    # hyprctl is the authoritative check: if it answers, we are in Hyprland
+    # even when the environment was inherited oddly (sudo, systemd service…).
+    if command -v hyprctl >/dev/null 2>&1 && hyprctl version >/dev/null 2>&1; then
+        current_type="hyprland"
+    fi
+
+    if [[ "$current" == "$target" ]]; then
+        # The label matches, but links may still have drifted (interrupted
+        # switch, old sekaipop leftovers). Reconcile them without a restart.
+        apply_desired_units || exit 1
+        apply_shell_wallpaper "$target"
+        ensure_keymap_overlay "$target" || true
+        if session_matches_shell "$target" && reload_current_session; then
+            notify "Already on $target — links and session reloaded" 2>/dev/null
+            echo "Already on $target. Links reconciled and session reloaded."
+        else
+            notify "Already on $target — links repaired" 2>/dev/null
+            echo "Already on $target. Links reconciled."
+            if ! session_matches_shell "$target"; then
+                echo "  This ricing belongs to $(session_type_label "$(shell_session_type "$target")"); log out and choose that session to apply it."
+            fi
+        fi
+        exit 0
+    fi
+
+    local live=1 reason=""
+    if (( LOGOUT_MODE )); then
+        live=0
+        reason="logout explicitly requested"
+    elif [[ "$target_type" != "hyprland" ]]; then
+        live=0
+        reason="'$target' is a $(session_type_label "$target_type") ricing"
+    elif [[ "$current_type" != "hyprland" ]]; then
+        live=0
+        reason="the current session is $(session_type_label "$current_type")"
+    elif ! command -v hyprctl >/dev/null 2>&1 || ! hyprctl version >/dev/null 2>&1; then
+        live=0
+        reason="Hyprland is not reachable"
+    fi
+    (( live )) || echo "  Live switch not possible: $reason — using the logout path."
+
+    if (( live )); then
+        stop_running_shells
+        if apply_shell_live "$target"; then
+            notify "Switched to $target — open windows kept" 2>/dev/null
+            echo "Switched to '$target'. Existing windows were kept open."
+            echo "Terminal windows already open keep their old config until reopened."
+            exit 0
+        fi
+
+        echo "ERROR: '$target' did not start live — reverting to '$current'." >&2
+        notify "$target failed to start — restoring $current" --urgency=critical 2>/dev/null
+        stop_running_shells
+        if [[ -n "$current" ]] && apply_shell_live "$current"; then
+            notify "Switch to $target failed — still on $current, windows kept" --urgency=critical 2>/dev/null
+            echo "Switch failed. Reverted to '$current'; open windows were kept." >&2
+            exit 1
+        fi
+
+        notify "Could not restore $current either — logging out to recover" --urgency=critical 2>/dev/null
+        echo "Recovery failed. Logging out so the desktop can come back cleanly." >&2
+        sleep 2
+        attempt_logout
+        exit $?
+    fi
+
+    if ! apply_desired_units; then
+        notify "Switch to $target failed while updating links" --urgency=critical 2>/dev/null
+        exit 1
+    fi
+    apply_shell_wallpaper "$target"
+    ensure_keymap_overlay "$target" || true
+    echo "$target" > "$CURRENT_SHELL_FILE"
+    notify "Switched to $target — logging out now to apply" 2>/dev/null
+    if [[ "$target_type" != "$current_type" ]]; then
+        echo "Links updated. '$target' runs in $(session_type_label "$target_type")."
+        echo "After logging out, choose the $(session_type_label "$target_type") session at the login screen."
+    else
+        echo "Links updated. Logging out to apply (open windows will close)."
+    fi
+    sleep 1.5
+    attempt_logout
+}
+
+# ---------------------------------------------------------------------------
+# --repair — reconcile links for the recorded current shell without restarting
+# the desktop or the running shell.
+# ---------------------------------------------------------------------------
+do_repair() {
+    discover_shells
+    local current=""
+    [[ -f "$CURRENT_SHELL_FILE" ]] && current="$(cat "$CURRENT_SHELL_FILE" 2>/dev/null || echo "")"
+    [[ -n "$current" ]] || current="default"
+
+    if [[ -z "${VALID_SHELLS[$current]:-}" ]]; then
+        echo "ERROR: current shell '$current' is not a known shell." >&2
+        exit 1
+    fi
+
+    echo "Repairing links for '$current' (no shell restart)..."
+    build_desired_units "$current"
+    if ! validate_desired_units; then
+        notify "Repair aborted — see terminal for details" --urgency=critical 2>/dev/null
+        exit 1
+    fi
+    apply_desired_units || exit 1
+    if [[ -n "${HYPR_SWITCH_LINKS_ONLY:-}" ]]; then
+        echo "Links reconciled for '$current' (links only)."
+        exit 0
+    fi
+    apply_shell_wallpaper "$current"
+    ensure_keymap_overlay "$current" || true
+
+    if session_matches_shell "$current" && reload_current_session; then
+        echo "Current session config reloaded."
+    elif ! session_matches_shell "$current"; then
+        echo "This ricing belongs to $(session_type_label "$(shell_session_type "$current")") — log out and choose that session to apply it."
+    fi
+    notify "Links repaired for $current" 2>/dev/null
+    echo "Done. Restart the shell if the interface still looks stale."
+}
+
+
+# ---------------------------------------------------------------------------
+# Logout fallback chain (unchanged in spirit from v1 — see README for why
+# a 4th 'loginctl terminate-user ""' method was deliberately removed after a
+# confirmed incident where it caused a full shutdown instead of a logout).
+# ---------------------------------------------------------------------------
+attempt_logout() {
+    if command -v uwsm >/dev/null 2>&1 && pgrep -x uwsm >/dev/null 2>&1; then
+        if uwsm stop 2>/dev/null; then
+            return 0
+        fi
+    fi
+    if [[ "$(current_session_type)" == "plasma" ]]; then
+        if command -v qdbus6 >/dev/null 2>&1; then
+            qdbus6 org.kde.Shutdown /Shutdown org.kde.Shutdown.logout >/dev/null 2>&1 && return 0
+            qdbus6 org.kde.ksmserver /KSMServer logout 0 0 0 >/dev/null 2>&1 && return 0
+        fi
+        if command -v qdbus >/dev/null 2>&1; then
+            qdbus org.kde.Shutdown /Shutdown org.kde.Shutdown.logout >/dev/null 2>&1 && return 0
+            qdbus org.kde.ksmserver /KSMServer logout 0 0 0 >/dev/null 2>&1 && return 0
+        fi
+    fi
+    if command -v hyprctl >/dev/null 2>&1; then
+        if hyprctl dispatch 'hl.dsp.exit()' >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    if command -v hyprctl >/dev/null 2>&1; then
+        if hyprctl dispatch exit >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    notify "Switched, but automatic logout failed — please log out manually" --urgency=critical 2>/dev/null
+    echo "Switched successfully, but could not log out automatically." >&2
+    echo "Log out manually to apply the change." >&2
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# --reload
+# ---------------------------------------------------------------------------
+do_reload() {
+    local current=""
+    [[ -f "$CURRENT_SHELL_FILE" ]] && current="$(cat "$CURRENT_SHELL_FILE" 2>/dev/null || echo "")"
+    [[ -n "$current" ]] || current="default"
+
+    if ! session_matches_shell "$current"; then
+        notify "This ricing belongs to $(session_type_label "$(shell_session_type "$current")") — log out to apply" --urgency=critical 2>/dev/null
+        echo "The current ricing ($current) belongs to $(session_type_label "$(shell_session_type "$current")")," >&2
+        echo "but this session is $(session_type_label "$(current_session_type)")." >&2
+        echo "Log out and choose the matching session to apply it." >&2
+        exit 1
+    fi
+
+    ensure_keymap_overlay "$current" || true
+
+    if reload_current_session; then
+        notify "Config reloaded" 2>/dev/null
+        echo "Config reloaded."
+        exit 0
+    fi
+    notify "Reload failed — try switching shells instead" --urgency=critical 2>/dev/null
+    echo "Reload failed." >&2
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Interactive picker
+# ---------------------------------------------------------------------------
+ensure_menu_theme() {
+    [[ -f "$MENU_THEME" ]] && return 0
+    mkdir -p "$(dirname "$MENU_THEME")" 2>/dev/null || return 1
+    cat > "$MENU_THEME" <<'RASI'
+/* ricing-switch menu — Catppuccin Mocha, editable. */
+* {
+    font: "JetBrainsMono Nerd Font 11";
+    background-color: #1e1e2e;
+    text-color: #cdd6f4;
+    border-color: #89b4fa;
+    selected-normal-background-color: #45475a;
+    selected-normal-foreground-color: #cdd6f4;
+    alternate-normal-background-color: #181825;
+    alternate-normal-foreground-color: #cdd6f4;
+    urgent-normal-background-color: #f38ba8;
+    urgent-normal-foreground-color: #1e1e2e;
+}
+window {
+    width: 660px;
+    border: 2px;
+    border-color: #89b4fa;
+    border-radius: 14px;
+    padding: 0;
+}
+mainbox {
+    padding: 16px;
+    spacing: 12px;
+}
+inputbar {
+    background-color: #313244;
+    border-radius: 10px;
+    padding: 10px 14px;
+    spacing: 8px;
+    children: [ prompt, entry ];
+}
+prompt {
+    text-color: #89b4fa;
+    font: "JetBrainsMono Nerd Font Bold 12";
+}
+entry {
+    text-color: #cdd6f4;
+    placeholder-color: #6c7086;
+}
+message {
+    text-color: #a6adc8;
+    padding: 2px 4px 0 4px;
+}
+listview {
+    lines: 10;
+    spacing: 4px;
+    padding: 2px 0 0 0;
+    scrollbar: false;
+}
+element {
+    padding: 9px 12px;
+    border-radius: 8px;
+}
+element selected {
+    background-color: #45475a;
+}
+element-text {
+    text-color: #cdd6f4;
+    vertical-align: 0.5;
+}
+element-icon {
+    size: 0;
+}
+RASI
+}
+
+# Build the menu rows once: "<name>  <type>  <count> items  <current marker>".
+# The name is always the first whitespace-delimited field, so the selected
+# row can be parsed without relying on rofi's output format.
+pick_shell() {
+    discover_shells
+    if [[ ${#VALID_SHELLS[@]} -eq 0 ]]; then
+        echo "No shells discovered yet. Run: ricing switch --bootstrap" >&2
+        return 1
+    fi
+
+    local current="" name type count marker width=0 current_index=0 i=0
+    [[ -f "$CURRENT_SHELL_FILE" ]] && current="$(cat "$CURRENT_SHELL_FILE" 2>/dev/null || true)"
+    local -a names=() rows=()
+    mapfile -t names < <(printf '%s\n' "${!VALID_SHELLS[@]}" | sort)
+    for name in "${names[@]}"; do
+        (( ${#name} > width )) && width=${#name}
+    done
+    for name in "${names[@]}"; do
+        type="$(session_type_label "$(shell_session_type "$name")")"
+        count="${VALID_SHELLS[$name]}"
+        marker=""
+        if [[ "$name" == "$current" ]]; then
+            marker="  · current"
+            current_index=$i
+        fi
+        rows+=("$(printf '%-*s  %-9s  %3s items%s' "$width" "$name" "$type" "$count" "$marker")")
+        i=$((i + 1))
+    done
+
+    local mesg="Current: <b>${current:-unknown}</b>  ·  Enter to switch  ·  Esc to cancel"
+    local choice=""
+
+    if command -v rofi >/dev/null 2>&1; then
+        ensure_menu_theme || true
+        local -a rofi_args=(-dmenu -i -no-custom -p 'Ricing' -mesg "$mesg" -l 10 -selected-row "$current_index")
+        [[ -f "$MENU_THEME" ]] && rofi_args+=(-theme "$MENU_THEME")
+        choice="$(printf '%s\n' "${rows[@]}" | rofi "${rofi_args[@]}")" || exit 0
+    else
+        # Terminal fallback: no rofi required.
+        echo "Ricings disponibles :"
+        local i=1
+        for name in "${names[@]}"; do
+            type="$(session_type_label "$(shell_session_type "$name")")"
+            printf '  %2d) %-*s  %s%s\n' "$i" "$width" "$name" "$type" \
+                "$([[ "$name" == "$current" ]] && echo '  (actuel)')"
+            i=$((i + 1))
+        done
+        [[ -t 0 ]] || { echo "rofi absent et pas de terminal interactif." >&2; return 1; }
+        local ans=""
+        read -r -p "Numéro ou nom (Entrée pour annuler) : " ans
+        [[ -z "$ans" ]] && return 0
+        if [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= ${#names[@]} )); then
+            choice="${names[$((ans - 1))]}"
+        else
+            choice="$ans"
+        fi
+    fi
+
+    [[ -z "$choice" ]] && exit 0
+    name="${choice%%[[:space:]]*}"
+    if [[ -z "${VALID_SHELLS[$name]:-}" ]]; then
+        echo "Unknown ricing: '$name'" >&2
+        exit 1
+    fi
+    do_switch "$name"
+}
+
+# ---------------------------------------------------------------------------
+# --help
+# ---------------------------------------------------------------------------
+print_help() {
+    discover_shells
+    echo "ricing switch — capture-based desktop ricing switcher"
+    echo "                 (Hyprland, KDE Plasma, Sway, Niri, …)"
+    echo ""
+    echo "Usage:"
+    echo "  ricing switch                     interactive picker (rofi or terminal)"
+    echo "  ricing switch <name>              switch to <name>"
+    echo "  ricing switch --logout <name>     force the full-logout path"
+    echo "  ricing switch --repair            reconcile links for the current ricing"
+    echo "  ricing switch --list              list discovered ricings"
+    echo "  ricing switch --reload            reload current config, no logout"
+    echo "  ricing switch --help              show this message"
+    echo "  ricing switch bootstrap           one-time whole-config capture as 'default'"
+    echo "  ricing switch capture-start <name>  begin capturing a new/updated ricing"
+    echo "  ricing switch capture-finish <name> finish capturing, diff, claim, symlink"
+    echo "  ricing switch capture-cancel        abort an in-progress capture"
+    echo "  ricing switch capture-status        show whether a capture is in progress"
+    echo "  ricing switch show <name>           list what a ricing owns"
+    echo ""
+    echo "Switching between two Hyprland ricings is live and keeps windows open."
+    echo "Switching to/from Plasma, Sway, Niri or any other session updates the"
+    echo "links and logs out; choose the matching session at the login screen."
+    echo ""
+    echo "Only desktop-interface config (hypr, quickshell, KDE/Plasma, bars,"
+    echo "terminals, lock/idle, GTK/Qt themes…) follows the selected ricing."
+    echo "Apps, files, accounts, browser and chat data always stay on the"
+    echo "'default' shell."
+    echo ""
+    echo "'hypr-switch' is kept as a compatibility alias."
+    if [[ ${#VALID_SHELLS[@]} -eq 0 ]]; then
+        echo "No ricings discovered yet. Run: ricing switch bootstrap"
+    else
+        echo "Discovered ricings:"
+        local n
+        for n in $(printf '%s\n' "${!VALID_SHELLS[@]}" | sort); do
+            printf '  - %-20s %-9s %s item(s)\n' "$n" \
+                "$(session_type_label "$(shell_session_type "$n")")" "${VALID_SHELLS[$n]}"
+        done
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Main dispatch
+# ---------------------------------------------------------------------------
+mkdir -p "$STORAGE_ROOT" "$SHELLS_DIR" 2>/dev/null
+
+# Parse global flags anywhere on the command line (e.g. `ricing switch
+# sekaipop --logout`), leaving positional arguments for the dispatch below.
+REPAIR_MODE=0
+LOGOUT_MODE=0
+POSITIONAL_ARGS=()
+for _arg in "$@"; do
+    case "$_arg" in
+        --repair) REPAIR_MODE=1 ;;
+        --logout) LOGOUT_MODE=1 ;;
+        *) POSITIONAL_ARGS+=("$_arg") ;;
+    esac
+done
+set -- ${POSITIONAL_ARGS[@]+"${POSITIONAL_ARGS[@]}"}
+
+if (( REPAIR_MODE )); then
+    do_repair
+    exit $?
+fi
+
+case "${1:-}" in
+    --help|-h)
+        print_help
+        exit 0
+        ;;
+    bootstrap|--bootstrap)
+        bootstrap_default
+        exit $?
+        ;;
+    capture-start)
+        cmd_capture_start "${2:-}"
+        exit $?
+        ;;
+    capture-finish)
+        cmd_capture_finish "${2:-}"
+        exit $?
+        ;;
+    capture-cancel)
+        cmd_capture_cancel
+        exit $?
+        ;;
+    capture-status)
+        cmd_capture_status
+        exit $?
+        ;;
+    show)
+        cmd_show "${2:-}"
+        exit $?
+        ;;
+    --config-items)
+        printf '%s\n' "${SWITCHABLE_CONFIG_ITEMS[@]}"
+        exit 0
+        ;;
+    --list)
+        discover_shells
+        if [[ ${#VALID_SHELLS[@]} -eq 0 ]]; then
+            echo "No shells discovered. Run: ricing switch --bootstrap" >&2
+            exit 1
+        fi
+        _current=""
+        [[ -f "$CURRENT_SHELL_FILE" ]] && _current="$(cat "$CURRENT_SHELL_FILE" 2>/dev/null || true)"
+        for n in $(printf '%s\n' "${!VALID_SHELLS[@]}" | sort); do
+            _marker=" "
+            [[ "$n" == "$_current" ]] && _marker="*"
+            printf '%s %s (%s item(s), %s)\n' "$_marker" "$n" "${VALID_SHELLS[$n]}" "$(session_type_label "$(shell_session_type "$n")")"
+        done
+        exit 0
+        ;;
+    --reload)
+        do_reload
+        ;;
+esac
+
+discover_shells
+if [[ ${#VALID_SHELLS[@]} -eq 0 ]]; then
+    notify "No shells found — run: ricing switch bootstrap" --urgency=critical 2>/dev/null
+    echo "No shells discovered yet. Run: ricing switch bootstrap" >&2
+    exit 1
+fi
+
+if [[ -z "${1:-}" ]]; then
+    pick_shell
+else
+    case "$1" in
+        switch|use)
+            shift
+            if [[ -z "${1:-}" ]]; then
+                pick_shell
+            else
+                do_switch "$1"
+            fi
+            ;;
+        *)
+            do_switch "$1"
+            ;;
+    esac
+fi
