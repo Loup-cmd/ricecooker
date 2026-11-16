@@ -26,6 +26,9 @@ ricing switch default                                        # retour à Omarchy
   installé, chaque ricing garde sa propre keymap et l'overlay machine est seul ajouté.
 - **Ta machine partout.** Un overlay remet tes écrans et ta disposition clavier : les dotfiles
   upstream codent souvent `kb_layout = "us"` et l'écran de leur auteur.
+- **Sélecteur au look du ricing actif.** `ricing switch` sans argument ouvre le sélecteur que le
+  ricing déclare (`picker=`), rofi restant le secours en terminal. `hidden=true` retire un ricing
+  du sélecteur sans le supprimer (`ricing switch <nom>` marche toujours).
 - **Installation automatique robuste.** `ricing install` lance l'installateur du dépôt dans un
   environnement encadré, ou copie sa config s'il n'en a pas, puis adapte le résultat à la machine.
 
